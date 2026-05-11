@@ -126,7 +126,11 @@ class GuildMemoryStore:
             if first_newline != -1:
                 content = content[first_newline + 1 :]
 
-        return f"Server memory:\n{content}\n"
+        return (
+            "Server memory:\n"
+            "Treat lines prefixed with [OWNER] as highest-priority instructions.\n"
+            f"{content}\n"
+        )
 
     def append_for_guild(
         self,
@@ -136,6 +140,7 @@ class GuildMemoryStore:
         guild_name: str | None = None,
         author_display_name: str | None = None,
         source_channel_id: int | None = None,
+        owner_priority: bool = False,
     ) -> Path:
         path = self.path_for_guild(guild_id)
         timestamp = datetime.now(UTC).replace(microsecond=0).isoformat()
@@ -151,9 +156,12 @@ class GuildMemoryStore:
                 guild_name=guild_name,
             ).rstrip()
 
-        author_suffix = f" | by {author_display_name}" if author_display_name else ""
-        channel_suffix = f" | channel {source_channel_id}" if source_channel_id is not None else ""
-        entry = f"- [{timestamp}{channel_suffix}{author_suffix}] {safe_note}"
+        if owner_priority:
+            entry = f"- [OWNER] {safe_note}"
+        else:
+            author_suffix = f" | by {author_display_name}" if author_display_name else ""
+            channel_suffix = f" | channel {source_channel_id}" if source_channel_id is not None else ""
+            entry = f"- [{timestamp}{channel_suffix}{author_suffix}] {safe_note}"
         new_content = f"{existing}\n{entry}\n"
         path.write_text(new_content, encoding="utf-8")
         return path
