@@ -182,6 +182,26 @@ class GuildMemoryStore:
         path.write_text(updated, encoding="utf-8")
         return path, True
 
+    def write_for_guild(
+        self,
+        *,
+        guild_id: int,
+        content: str,
+    ) -> Path:
+        path = self.path_for_guild(guild_id)
+        path.write_text(content.rstrip() + "\n", encoding="utf-8")
+        return path
+
+    def clear_for_guild(
+        self,
+        *,
+        guild_id: int,
+        guild_name: str | None = None,
+    ) -> Path:
+        path = self.path_for_guild(guild_id)
+        path.write_text(self._new_file_header(guild_id=guild_id, guild_name=guild_name), encoding="utf-8")
+        return path
+
     @staticmethod
     def _new_file_header(*, guild_id: int, guild_name: str | None) -> str:
         safe_guild_name = guild_name or "unknown"

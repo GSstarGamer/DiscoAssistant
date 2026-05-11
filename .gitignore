@@ -8,3 +8,4 @@ memories/guilds/*.md
 memories/*.sqlite3
 *.stdout.log
 *.stderr.log
+*.runtime.log

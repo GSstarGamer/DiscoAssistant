@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from collections import deque
 from dataclasses import dataclass, field
+from logging.handlers import RotatingFileHandler
 from time import monotonic
 from typing import Any
 from collections.abc import Iterable
@@ -15,6 +17,7 @@ import discord
 from discoassistant.config import BASE_DIR, AppConfig, load_app_config
 from discoassistant.dm_history import DmHistoryStore
 from discoassistant.memory import GuildMemoryStore, UserMemoryStore
+from discoassistant.passive_guild_history import PassiveGuildHistoryStore
 
 
 LOGGER = logging.getLogger("discoassistant")
@@ -24,6 +27,7 @@ LOGGER = logging.getLogger("discoassistant")
 class ActiveConversation:
     messages: list[dict[str, str]] = field(default_factory=list)
     expires_at: float = 0.0
+    interrupted_by_other_user: bool = False
 
 
 @dataclass(slots=True)
@@ -51,6 +55,8 @@ class DiscoAssistant(discord.Client):
         self._session_total_tokens_used = 0
         self._presence_update_task: asyncio.Task[None] | None = None
         self._presence_refresh_requested = False
+        self._passive_guild_poller_task: asyncio.Task[None] | None = None
+        self._passive_guild_summary_tasks: dict[int, asyncio.Task[None]] = {}
         self.user_memory_store = UserMemoryStore(
             base_dir=BASE_DIR / self.app_config.runtime.memory.user_directory,
             max_chars_in_prompt=self.app_config.runtime.memory.max_user_chars_in_prompt,
@@ -61,6 +67,9 @@ class DiscoAssistant(discord.Client):
         )
         self.dm_history_store = DmHistoryStore(
             db_path=BASE_DIR / self.app_config.runtime.memory.dm_history_db_path,
+        )
+        self.passive_guild_history_store = PassiveGuildHistoryStore(
+            db_path=BASE_DIR / self.app_config.runtime.passive_guild_memory.db_path,
         )
 
     async def setup_hook(self) -> None:
@@ -82,6 +91,7 @@ class DiscoAssistant(discord.Client):
 
     async def on_ready(self) -> None:
         await self._apply_configured_presence()
+        self._ensure_passive_guild_poller()
 
         if self._startup_announced:
             LOGGER.info("Reconnected as %s (%s)", self.user, self.user.id if self.user else "unknown")
@@ -244,12 +254,522 @@ class DiscoAssistant(discord.Client):
         finally:
             self._presence_update_task = None
 
+    def _ensure_passive_guild_poller(self) -> None:
+        passive_config = self.app_config.runtime.passive_guild_memory
+        if not passive_config.enabled:
+            return
+        if self._passive_guild_poller_task is not None and not self._passive_guild_poller_task.done():
+            return
+        self._passive_guild_poller_task = asyncio.create_task(self._passive_guild_poller_loop())
+
+    async def _passive_guild_poller_loop(self) -> None:
+        poll_interval = max(5, self.app_config.runtime.passive_guild_memory.poll_interval_seconds)
+        try:
+            while not self.is_closed():
+                try:
+                    await self._scan_passive_guild_memory()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    LOGGER.exception("Passive guild memory scan failed.")
+                await asyncio.sleep(poll_interval)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._passive_guild_poller_task = None
+
+    async def _scan_passive_guild_memory(self) -> None:
+        enabled_guild_ids = self.app_config.runtime.passive_guild_memory.enabled_guild_ids
+        guild_ids = self.passive_guild_history_store.list_guild_ids_with_pending_messages(
+            enabled_guild_ids=enabled_guild_ids,
+        )
+        for guild_id in guild_ids:
+            await self._maybe_start_passive_guild_summary_for_guild(guild_id)
+
+    async def _maybe_start_passive_guild_summary_for_guild(self, guild_id: int) -> None:
+        if not self._passive_guild_enabled_for_guild(guild_id):
+            return
+
+        running_task = self._passive_guild_summary_tasks.get(guild_id)
+        if running_task is not None and not running_task.done():
+            return
+
+        rows = self.passive_guild_history_store.read_batch_for_guild(guild_id=guild_id)
+        if not rows:
+            return
+
+        current_memory = self.guild_memory_store.read_for_guild(guild_id)
+        estimated_tokens = self._estimate_passive_guild_prompt_tokens(
+            guild_id=guild_id,
+            guild_name=self._latest_guild_name(guild_id, rows),
+            current_memory=current_memory,
+            rows=rows,
+        )
+        if estimated_tokens < self._passive_guild_flush_threshold_tokens():
+            return
+
+        self._passive_guild_summary_tasks[guild_id] = asyncio.create_task(
+            self._run_passive_guild_summary(guild_id)
+        )
+
+    async def _run_passive_guild_summary(self, guild_id: int, *, force: bool = False) -> None:
+        try:
+            rows = self.passive_guild_history_store.read_batch_for_guild(guild_id=guild_id)
+            if not rows:
+                return
+
+            guild_name = self._latest_guild_name(guild_id, rows)
+            current_memory = self.guild_memory_store.read_for_guild(guild_id)
+            if (
+                not force
+                and self._estimate_passive_guild_prompt_tokens(
+                    guild_id=guild_id,
+                    guild_name=guild_name,
+                    current_memory=current_memory,
+                    rows=rows,
+                ) < self._passive_guild_flush_threshold_tokens()
+            ):
+                return
+
+            selected_rows = self._select_passive_guild_rows_for_flush(
+                guild_id=guild_id,
+                guild_name=guild_name,
+                current_memory=current_memory,
+                rows=rows,
+            )
+            if not selected_rows:
+                return
+
+            summary_payload = await self._summarize_passive_guild_rows(
+                guild_id=guild_id,
+                guild_name=guild_name,
+                current_memory=current_memory,
+                rows=selected_rows,
+            )
+            rendered_memory = self._render_passive_guild_memory_snapshot(
+                guild_id=guild_id,
+                guild_name=guild_name,
+                summary_payload=summary_payload,
+            )
+            self.guild_memory_store.write_for_guild(
+                guild_id=guild_id,
+                content=rendered_memory,
+            )
+            await self._notify_owner_of_guild_memory_update(
+                guild_id=guild_id,
+                guild_name=guild_name,
+                summary=self._passive_guild_owner_summary(summary_payload),
+            )
+            self.passive_guild_history_store.delete_messages_through_row_id(
+                guild_id=guild_id,
+                max_row_id=int(selected_rows[-1]["row_id"]),
+            )
+            LOGGER.info(
+                "Passive guild memory updated guild_id=%s messages=%s",
+                guild_id,
+                len(selected_rows),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception("Passive guild summarization failed guild_id=%s", guild_id)
+        finally:
+            current_task = self._passive_guild_summary_tasks.get(guild_id)
+            if current_task is asyncio.current_task():
+                self._passive_guild_summary_tasks.pop(guild_id, None)
+
+    async def _flush_passive_guild_memory_now(self, guild_id: int) -> dict[str, Any]:
+        running_task = self._passive_guild_summary_tasks.get(guild_id)
+        if running_task is not None and not running_task.done():
+            await running_task
+        else:
+            await self._run_passive_guild_summary(guild_id, force=True)
+
+        pending_rows = self.passive_guild_history_store.read_batch_for_guild(guild_id=guild_id)
+        return {
+            "ok": True,
+            "guild_id": guild_id,
+            "pending_message_count": len(pending_rows),
+            "status": "flushed" if not pending_rows else "partial_or_waiting",
+        }
+
+    def _passive_guild_enabled_for_guild(self, guild_id: int) -> bool:
+        passive_config = self.app_config.runtime.passive_guild_memory
+        if not passive_config.enabled:
+            return False
+        if passive_config.enabled_guild_ids is None:
+            return True
+        return guild_id in passive_config.enabled_guild_ids
+
+    def _passive_guild_flush_threshold_tokens(self) -> int:
+        passive_config = self.app_config.runtime.passive_guild_memory
+        return max(1024, int(passive_config.effective_context_limit_tokens * passive_config.flush_ratio))
+
+    def _estimate_passive_guild_prompt_tokens(
+        self,
+        *,
+        guild_id: int,
+        guild_name: str,
+        current_memory: str,
+        rows: list[dict[str, Any]],
+    ) -> int:
+        passive_config = self.app_config.runtime.passive_guild_memory
+        prompt_text = self._passive_guild_summary_prompt_text(
+            guild_id=guild_id,
+            guild_name=guild_name,
+            current_memory=current_memory,
+            rows=rows,
+        )
+        return (len(prompt_text) // 4) + passive_config.max_output_tokens
+
+    def _select_passive_guild_rows_for_flush(
+        self,
+        *,
+        guild_id: int,
+        guild_name: str,
+        current_memory: str,
+        rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        passive_config = self.app_config.runtime.passive_guild_memory
+        prompt_budget_tokens = max(
+            1024,
+            self._passive_guild_flush_threshold_tokens() - passive_config.max_output_tokens,
+        )
+        prompt_budget_chars = prompt_budget_tokens * 4
+        base_chars = len(
+            self._passive_guild_summary_prompt_text(
+                guild_id=guild_id,
+                guild_name=guild_name,
+                current_memory=current_memory,
+                rows=[],
+            )
+        )
+
+        selected_rows: list[dict[str, Any]] = []
+        active_channel_id: int | None = None
+        current_chars = base_chars
+        for row in rows:
+            channel_header = ""
+            if row["channel_id"] != active_channel_id:
+                channel_name = row.get("channel_name") or f"channel-{row['channel_id']}"
+                channel_header = f"\n## Channel: {channel_name} ({row['channel_id']})\n"
+
+            row_line = self._passive_guild_row_text(row)
+            projected_chars = current_chars + len(channel_header) + len(row_line)
+            if selected_rows and projected_chars > prompt_budget_chars:
+                break
+
+            selected_rows.append(row)
+            current_chars = projected_chars
+            active_channel_id = int(row["channel_id"])
+
+        if not selected_rows and rows:
+            return [rows[0]]
+        return selected_rows
+
+    async def _summarize_passive_guild_rows(
+        self,
+        *,
+        guild_id: int,
+        guild_name: str,
+        current_memory: str,
+        rows: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        passive_config = self.app_config.runtime.passive_guild_memory
+        models = [passive_config.primary_model]
+        if passive_config.fallback_model and passive_config.fallback_model not in models:
+            models.append(passive_config.fallback_model)
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You maintain long-term guild memory for a Discord assistant.\n"
+                    "You receive existing guild memory plus a chronological batch of new messages.\n"
+                    "Revise memory carefully: preserve useful old facts, remove stale claims, merge duplicates, and add new useful observations.\n"
+                    "Capture guild-level norms, channel habits, recurring topics, jokes, relationships, and lightweight observable member traits.\n"
+                    "Allowed member traits are only observable behavior such as talkative, kind, likes certain topics, often helps, often jokes, or recurring habits.\n"
+                    "Do not infer sensitive traits or hidden attributes.\n"
+                    "Return strict JSON only with keys guild_notes, channel_notes, member_notes.\n"
+                    "Each key must map to a list.\n"
+                    "channel_notes items must contain channel_id, channel_name, notes.\n"
+                    "member_notes items must contain user_id, username, notes."
+                ),
+            },
+            {
+                "role": "user",
+                "content": self._passive_guild_summary_prompt_text(
+                    guild_id=guild_id,
+                    guild_name=guild_name,
+                    current_memory=current_memory,
+                    rows=rows,
+                ),
+            },
+        ]
+
+        last_error: Exception | None = None
+        for model in models:
+            try:
+                response = await self.openrouter_chat(
+                    model=model,
+                    messages=messages,
+                    extra_payload={
+                        "temperature": passive_config.temperature,
+                        "max_tokens": passive_config.max_output_tokens,
+                    },
+                )
+                text = self.extract_response_text(response, messages=messages)
+                return self._parse_passive_guild_summary_json(text)
+            except Exception as exc:
+                last_error = exc
+                LOGGER.warning(
+                    "Passive guild summarizer failed model=%s guild_id=%s error=%s",
+                    model,
+                    guild_id,
+                    exc,
+                )
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Passive guild summarizer failed without a captured exception.")
+
+    def _passive_guild_summary_prompt_text(
+        self,
+        *,
+        guild_id: int,
+        guild_name: str,
+        current_memory: str,
+        rows: list[dict[str, Any]],
+    ) -> str:
+        memory_text = current_memory.strip() or "(none)"
+        messages_text = self._serialize_passive_guild_rows(rows).strip() or "(no messages)"
+        return (
+            f"Guild ID: {guild_id}\n"
+            f"Guild name: {guild_name}\n\n"
+            "Current guild memory:\n"
+            f"{memory_text}\n\n"
+            "New raw guild messages, grouped by channel:\n"
+            f"{messages_text}\n"
+        )
+
+    def _serialize_passive_guild_rows(self, rows: list[dict[str, Any]]) -> str:
+        if not rows:
+            return ""
+
+        lines: list[str] = []
+        active_channel_id: int | None = None
+        for row in rows:
+            channel_id = int(row["channel_id"])
+            if channel_id != active_channel_id:
+                channel_name = row.get("channel_name") or f"channel-{channel_id}"
+                lines.append(f"## Channel: {channel_name} ({channel_id})")
+                active_channel_id = channel_id
+            lines.append(self._passive_guild_row_text(row).rstrip())
+        return "\n".join(lines)
+
+    @staticmethod
+    def _passive_guild_row_text(row: dict[str, Any]) -> str:
+        created_at = row.get("created_at") or "unknown-time"
+        author_username = row.get("author_username") or "unknown-user"
+        author_id = row.get("author_id")
+        content = row.get("content") or ""
+        return f"- [{created_at}] {author_username} ({author_id}): {content}\n"
+
+    def _parse_passive_guild_summary_json(self, text: str) -> dict[str, Any]:
+        candidate_texts = [text.strip()]
+        stripped = text.strip()
+        if stripped.startswith("```"):
+            stripped = stripped.strip("`")
+            if stripped.startswith("json"):
+                stripped = stripped[4:].lstrip()
+            candidate_texts.append(stripped)
+        first_brace = text.find("{")
+        last_brace = text.rfind("}")
+        if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+            candidate_texts.append(text[first_brace : last_brace + 1].strip())
+
+        parsed: dict[str, Any] | None = None
+        for candidate in candidate_texts:
+            if not candidate:
+                continue
+            try:
+                value = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                parsed = value
+                break
+
+        if parsed is None:
+            raise ValueError("Passive guild summarizer did not return valid JSON.")
+
+        guild_notes = parsed.get("guild_notes")
+        channel_notes = parsed.get("channel_notes")
+        member_notes = parsed.get("member_notes")
+        if not isinstance(guild_notes, list) or not isinstance(channel_notes, list) or not isinstance(member_notes, list):
+            raise ValueError("Passive guild summary JSON is missing required list keys.")
+
+        return {
+            "guild_notes": [str(item).strip() for item in guild_notes if str(item).strip()],
+            "channel_notes": [
+                {
+                    "channel_id": int(item.get("channel_id")),
+                    "channel_name": str(item.get("channel_name", "")).strip() or f"channel-{item.get('channel_id')}",
+                    "notes": [str(note).strip() for note in item.get("notes", []) if str(note).strip()],
+                }
+                for item in channel_notes
+                if isinstance(item, dict) and item.get("channel_id") is not None
+            ],
+            "member_notes": [
+                {
+                    "user_id": int(item.get("user_id")),
+                    "username": str(item.get("username", "")).strip() or f"user-{item.get('user_id')}",
+                    "notes": [str(note).strip() for note in item.get("notes", []) if str(note).strip()],
+                }
+                for item in member_notes
+                if isinstance(item, dict) and item.get("user_id") is not None
+            ],
+        }
+
+    def _render_passive_guild_memory_snapshot(
+        self,
+        *,
+        guild_id: int,
+        guild_name: str,
+        summary_payload: dict[str, Any],
+    ) -> str:
+        lines = [
+            f"# Server Memory: {guild_id}",
+            "",
+            f"- Guild ID: {guild_id}",
+            f"- Last known guild name: {guild_name}",
+            "",
+            "## Guild Notes",
+        ]
+
+        guild_notes = summary_payload.get("guild_notes", [])
+        if guild_notes:
+            for note in guild_notes:
+                lines.append(f"- {note}")
+        else:
+            lines.append("- (none)")
+
+        lines.extend(["", "## Channel Notes"])
+        channel_notes = summary_payload.get("channel_notes", [])
+        if channel_notes:
+            for item in channel_notes:
+                lines.append(f"### {item['channel_name']} ({item['channel_id']})")
+                if item["notes"]:
+                    for note in item["notes"]:
+                        lines.append(f"- {note}")
+                else:
+                    lines.append("- (none)")
+        else:
+            lines.append("- (none)")
+
+        lines.extend(["", "## Member Notes"])
+        member_notes = summary_payload.get("member_notes", [])
+        if member_notes:
+            for item in member_notes:
+                lines.append(f"### {item['username']} ({item['user_id']})")
+                if item["notes"]:
+                    for note in item["notes"]:
+                        lines.append(f"- {note}")
+                else:
+                    lines.append("- (none)")
+        else:
+            lines.append("- (none)")
+
+        return "\n".join(lines)
+
+    def _passive_guild_owner_summary(self, summary_payload: dict[str, Any]) -> str:
+        lines: list[str] = []
+
+        guild_notes = summary_payload.get("guild_notes", [])
+        if guild_notes:
+            lines.append("Guild notes:")
+            for note in guild_notes[:3]:
+                lines.append(f"- {note}")
+
+        channel_notes = summary_payload.get("channel_notes", [])
+        if channel_notes:
+            lines.append("Channel notes:")
+            for item in channel_notes[:2]:
+                channel_name = item.get("channel_name") or item.get("channel_id")
+                note_list = item.get("notes", [])
+                if note_list:
+                    lines.append(f"- {channel_name}: {note_list[0]}")
+
+        member_notes = summary_payload.get("member_notes", [])
+        if member_notes:
+            lines.append("Member notes:")
+            for item in member_notes[:3]:
+                username = item.get("username") or item.get("user_id")
+                note_list = item.get("notes", [])
+                if note_list:
+                    lines.append(f"- {username}: {note_list[0]}")
+
+        if not lines:
+            return "Memory snapshot updated, but there were no non-empty summary notes."
+        return "\n".join(lines)
+
+    def _latest_guild_name(self, guild_id: int, rows: list[dict[str, Any]]) -> str:
+        guild = self.get_guild(guild_id)
+        if guild is not None and getattr(guild, "name", None):
+            return guild.name
+        for row in reversed(rows):
+            guild_name = str(row.get("guild_name") or "").strip()
+            if guild_name:
+                return guild_name
+        return "unknown"
+
+    def _store_passive_guild_message(self, message: discord.Message) -> None:
+        if message.guild is None:
+            return
+        if not self._passive_guild_enabled_for_guild(message.guild.id):
+            return
+
+        content = self._passive_guild_content_for_message(message)
+        if not content:
+            return
+
+        self.passive_guild_history_store.append_message(
+            guild_id=message.guild.id,
+            guild_name=message.guild.name,
+            channel_id=message.channel.id,
+            channel_name=getattr(message.channel, "name", None),
+            author_id=message.author.id,
+            author_username=getattr(message.author, "name", str(message.author)),
+            content=content,
+            discord_message_id=message.id,
+            created_at=message.created_at.isoformat() if message.created_at else None,
+        )
+        running_task = self._passive_guild_summary_tasks.get(message.guild.id)
+        if running_task is None or running_task.done():
+            asyncio.create_task(self._maybe_start_passive_guild_summary_for_guild(message.guild.id))
+
+    @staticmethod
+    def _passive_guild_content_for_message(message: discord.Message) -> str:
+        parts: list[str] = []
+        text = message.content.strip()
+        if text:
+            parts.append(text)
+        if message.attachments:
+            filenames = ", ".join(attachment.filename for attachment in message.attachments if attachment.filename)
+            parts.append(f"[attachments: {filenames or len(message.attachments)}]")
+        if getattr(message, "embeds", None):
+            parts.append(f"[embeds: {len(message.embeds)}]")
+        if getattr(message, "stickers", None):
+            parts.append(f"[stickers: {len(message.stickers)}]")
+        return " ".join(parts).strip()
+
     async def on_message(self, message: discord.Message) -> None:
         self._append_passive_channel_context(message)
 
         if not self._should_consider_message(message):
             return
 
+        self._store_passive_guild_message(message)
         self._store_incoming_dm_message(message)
 
         is_direct_mention = self._should_respond_to_message(message)
@@ -278,6 +798,11 @@ class DiscoAssistant(discord.Client):
         for task in self._reply_tasks.values():
             if not task.done():
                 task.cancel()
+        for task in self._passive_guild_summary_tasks.values():
+            if not task.done():
+                task.cancel()
+        if self._passive_guild_poller_task is not None and not self._passive_guild_poller_task.done():
+            self._passive_guild_poller_task.cancel()
         if self._presence_update_task is not None and not self._presence_update_task.done():
             self._presence_update_task.cancel()
         if self.http_session is not None and not self.http_session.closed:
@@ -303,8 +828,17 @@ class DiscoAssistant(discord.Client):
 
         max_attempts = 4
         last_error: Exception | None = None
+        selected_model = model or self.app_config.runtime.openrouter.default_model
         for attempt in range(1, max_attempts + 1):
+            request_started_at = monotonic()
             try:
+                LOGGER.info(
+                    "OpenRouter request start model=%s attempt=%s messages=%s tools=%s",
+                    selected_model,
+                    attempt,
+                    len(messages),
+                    "tools" in payload,
+                )
                 async with self.http_session.post(
                     f"{self.app_config.runtime.openrouter.base_url}/chat/completions",
                     json=payload,
@@ -312,32 +846,57 @@ class DiscoAssistant(discord.Client):
                     response.raise_for_status()
                     response_payload = await response.json()
                     self._record_token_usage(response_payload)
+                    LOGGER.info(
+                        "OpenRouter request success model=%s attempt=%s duration=%.2fs",
+                        selected_model,
+                        attempt,
+                        monotonic() - request_started_at,
+                    )
                     return response_payload
             except aiohttp.ClientResponseError as exc:
                 last_error = exc
                 should_retry = exc.status in {429, 500, 502, 503, 504} and attempt < max_attempts
                 if not should_retry:
+                    LOGGER.error(
+                        "OpenRouter request failed model=%s attempt=%s duration=%.2fs status=%s error=%s",
+                        selected_model,
+                        attempt,
+                        monotonic() - request_started_at,
+                        exc.status,
+                        exc,
+                    )
                     raise
 
                 retry_after = self._retry_after_seconds(exc.headers)
                 delay = retry_after if retry_after is not None else min(8.0, 1.5 * (2 ** (attempt - 1)))
                 LOGGER.warning(
-                    "OpenRouter request failed status=%s attempt=%s/%s retry_in=%.2fs",
+                    "OpenRouter request failed model=%s status=%s attempt=%s/%s duration=%.2fs retry_in=%.2fs",
+                    selected_model,
                     exc.status,
                     attempt,
                     max_attempts,
+                    monotonic() - request_started_at,
                     delay,
                 )
                 await asyncio.sleep(delay)
             except aiohttp.ClientError as exc:
                 last_error = exc
                 if attempt >= max_attempts:
+                    LOGGER.error(
+                        "OpenRouter network error model=%s attempt=%s duration=%.2fs error=%s",
+                        selected_model,
+                        attempt,
+                        monotonic() - request_started_at,
+                        exc,
+                    )
                     raise
                 delay = min(8.0, 1.0 * (2 ** (attempt - 1)))
                 LOGGER.warning(
-                    "OpenRouter network error attempt=%s/%s retry_in=%.2fs error=%s",
+                    "OpenRouter network error model=%s attempt=%s/%s duration=%.2fs retry_in=%.2fs error=%s",
+                    selected_model,
                     attempt,
                     max_attempts,
+                    monotonic() - request_started_at,
                     delay,
                     exc,
                 )
@@ -401,6 +960,7 @@ class DiscoAssistant(discord.Client):
         memory_context = self._user_memory_context_for_message(message)
         server_memory_context = self._server_memory_context_for_message(message)
         pending_burst_context = self._pending_burst_context(pending_messages, latest_message_id=message.id)
+        reply_reference_context = await self._reply_reference_context(message)
 
         messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
         if self._is_direct_message(message):
@@ -425,6 +985,7 @@ class DiscoAssistant(discord.Client):
                         "Never say a message was sent unless tool result explicitly says ok true. "
                         "If a tool call fails, keep working and retry when possible. "
                         "Keep reply short."
+                        f"\n{reply_reference_context}"
                         f"\n{memory_context}"
                     ),
                 }
@@ -440,6 +1001,8 @@ class DiscoAssistant(discord.Client):
                     f"Author username: {message.author}\n"
                     f"Author display name: {self._display_name_for_message_author(message)}\n"
                     f"{self._mentioned_users_context(message)}"
+                    f"{self._mentioned_channels_context(message)}"
+                    f"{reply_reference_context}"
                     f"Channel message: {message.content.strip()}\n"
                     "If this is a mention-only message, do not send a generic greeting. Use recent channel history to infer what the user is asking and answer that directly.\n"
                     "When using send_message, never guess recipient. Use an explicit mentioned user id or the owner user id. If target is unclear, say so instead of sending.\n"
@@ -568,17 +1131,34 @@ class DiscoAssistant(discord.Client):
             pending = self._pending_replies.get(key)
             pending_messages = pending.messages if pending is not None else [message]
             should_respond = self._should_respond_to_message(message)
+            had_active_conversation = self._has_active_conversation(message)
             if not should_respond and pending is not None and pending.started_from_mention:
                 LOGGER.info("reply task treating key=%s message_id=%s as pending mention follow-up", key, message.id)
                 should_respond = True
-            if not should_respond and pending is not None and pending.started_from_active_conversation:
-                LOGGER.info("reply task treating key=%s message_id=%s as active-conversation burst", key, message.id)
-                should_respond = True
-            if not should_respond and self._has_active_conversation(message):
-                LOGGER.info("checking follow-up classifier key=%s message_id=%s", key, message.id)
+            if (
+                not should_respond
+                and (
+                    had_active_conversation
+                    or (pending is not None and pending.started_from_active_conversation)
+                )
+            ):
+                LOGGER.info(
+                    "checking active-conversation classifier key=%s message_id=%s started_from_active=%s active_now=%s",
+                    key,
+                    message.id,
+                    pending.started_from_active_conversation if pending is not None else False,
+                    had_active_conversation,
+                )
                 should_respond = await self._should_treat_active_conversation_message_as_follow_up(message)
 
             if not should_respond:
+                if had_active_conversation and self._should_send_not_my_conversation_reply(message):
+                    LOGGER.info("reply task sending not-my-conversation notice key=%s message_id=%s", key, message.id)
+                    sent_message = await self._send_channel_reply(
+                        message,
+                        "Not my conversation - carry on.",
+                    )
+                    self._store_outgoing_dm_message(sent_message)
                 LOGGER.info("reply task exit key=%s message_id=%s reason=should_not_respond", key, message.id)
                 return
 
@@ -588,7 +1168,7 @@ class DiscoAssistant(discord.Client):
             async with message.channel.typing():
                 reply_text = await self.generate_reply_for_message(message, pending_messages)
             LOGGER.info("generation done key=%s message_id=%s reply=%r", key, message.id, reply_text)
-            sent_message = await message.channel.send(reply_text, reference=message)
+            sent_message = await self._send_channel_reply(message, reply_text)
             self._store_outgoing_dm_message(sent_message)
             LOGGER.info("reply sent key=%s message_id=%s", key, message.id)
         except asyncio.CancelledError:
@@ -599,9 +1179,7 @@ class DiscoAssistant(discord.Client):
             message = pending.message if pending is not None else None
             if message is not None:
                 LOGGER.exception("Failed to generate or send reply for message %s", message.id)
-                await message.channel.send(
-                    self._safe_runtime_error_reply(exc)
-                )
+                await self._send_channel_reply(message, self._safe_runtime_error_reply(exc))
             else:
                 LOGGER.exception("Failed to generate or send reply for conversation %s", key)
         finally:
@@ -642,6 +1220,38 @@ class DiscoAssistant(discord.Client):
                 sleep_for,
             )
             await asyncio.sleep(sleep_for)
+
+    async def _send_channel_reply(self, message: discord.Message, content: str) -> discord.Message:
+        try:
+            return await message.channel.send(content, reference=message)
+        except discord.HTTPException as exc:
+            if "Unknown message" not in str(exc):
+                raise
+            LOGGER.warning(
+                "Reply reference failed for message_id=%s channel_id=%s; retrying without reference",
+                message.id,
+                message.channel.id,
+            )
+            return await message.channel.send(content)
+
+    def _should_send_not_my_conversation_reply(self, message: discord.Message) -> bool:
+        conversation = self._get_active_conversation(message)
+        if conversation is None:
+            return False
+        if not conversation.interrupted_by_other_user:
+            return False
+        return self._message_explicitly_targets_assistant(message)
+
+    def _message_explicitly_targets_assistant(self, message: discord.Message) -> bool:
+        if self._should_respond_to_message(message):
+            return True
+        if self.user is None:
+            return False
+        reference = getattr(message, "reference", None)
+        resolved = getattr(reference, "resolved", None)
+        if isinstance(resolved, discord.Message):
+            return resolved.author.id == self.user.id
+        return False
 
     async def _run_chat_with_tools_if_needed(
         self,
@@ -767,6 +1377,16 @@ class DiscoAssistant(discord.Client):
         if conversation is None:
             return False
 
+        heuristic = self._heuristic_active_follow_up_decision(message)
+        if heuristic is not None:
+            LOGGER.info(
+                "active-conversation heuristic decided message_id=%s result=%s content=%r",
+                message.id,
+                heuristic,
+                message.content,
+            )
+            return heuristic
+
         transcript_lines: list[str] = []
         for item in conversation.messages[-6:]:
             role = item.get("role", "unknown")
@@ -802,7 +1422,79 @@ class DiscoAssistant(discord.Client):
             },
         )
         decision = self.extract_response_text(response).strip().upper()
+        if not decision:
+            heuristic = self._heuristic_active_follow_up_decision(message)
+            if heuristic is not None:
+                LOGGER.info(
+                    "active-conversation classifier returned no text; using heuristic message_id=%s result=%s",
+                    message.id,
+                    heuristic,
+                )
+                return heuristic
         return decision.startswith("YES")
+
+    def _heuristic_active_follow_up_decision(self, message: discord.Message) -> bool | None:
+        content = (message.content or "").strip()
+        if not content:
+            return None
+
+        lowered = content.casefold()
+        if lowered.endswith("?"):
+            return True
+
+        follow_up_starters = (
+            "what",
+            "why",
+            "how",
+            "when",
+            "where",
+            "who",
+            "which",
+            "can",
+            "could",
+            "would",
+            "should",
+            "do",
+            "does",
+            "did",
+            "is",
+            "are",
+            "am",
+            "will",
+            "would",
+            "tell",
+            "show",
+            "explain",
+        )
+        if lowered.startswith(follow_up_starters):
+            return True
+
+        acknowledgement_followups = {
+            "ok",
+            "okay",
+            "alr",
+            "alright",
+            "lol",
+            "lmao",
+            "real",
+            "true",
+            "same",
+            "aw",
+            "aww",
+            "❤️",
+            "🥹",
+            "🤤",
+        }
+        if lowered in acknowledgement_followups:
+            return True
+
+        words = [part for part in re.split(r"\s+", content) if part]
+        if len(words) >= 2:
+            first = re.sub(r"^[^A-Za-z0-9]+|[^A-Za-z0-9]+$", "", words[0]).casefold()
+            if first and first not in follow_up_starters and first not in {"i", "im", "i'm", "you", "yo", "hey", "hi"}:
+                return False
+
+        return None
 
     async def _execute_tool_call(
         self,
@@ -813,23 +1505,41 @@ class DiscoAssistant(discord.Client):
         function_name = function_payload.get("name", "")
         raw_arguments = function_payload.get("arguments", "{}")
         arguments = json.loads(raw_arguments)
+        started_at = monotonic()
+        LOGGER.info(
+            "Tool call start name=%s arguments=%s",
+            function_name,
+            raw_arguments,
+        )
 
         if function_name == "get_channel_history":
-            return await self._tool_get_channel_history(arguments, tool_context)
-        if function_name == "append_user_memory":
-            return await self._tool_append_user_memory(arguments, tool_context)
-        if function_name == "edit_user_memory":
-            return await self._tool_edit_user_memory(arguments, tool_context)
-        if function_name == "append_server_memory":
-            return await self._tool_append_server_memory(arguments, tool_context)
-        if function_name == "edit_server_memory":
-            return await self._tool_edit_server_memory(arguments, tool_context)
-        if function_name == "get_user_details":
-            return await self._tool_get_user_details(arguments, tool_context)
-        if function_name == "send_message":
-            return await self._tool_send_message(arguments, tool_context)
+            result = await self._tool_get_channel_history(arguments, tool_context)
+        elif function_name == "append_user_memory":
+            result = await self._tool_append_user_memory(arguments, tool_context)
+        elif function_name == "edit_user_memory":
+            result = await self._tool_edit_user_memory(arguments, tool_context)
+        elif function_name == "get_user_memory":
+            result = await self._tool_get_user_memory(arguments, tool_context)
+        elif function_name == "append_server_memory":
+            result = await self._tool_append_server_memory(arguments, tool_context)
+        elif function_name == "edit_server_memory":
+            result = await self._tool_edit_server_memory(arguments, tool_context)
+        elif function_name == "flush_passive_server_memory":
+            result = await self._tool_flush_passive_server_memory(arguments, tool_context)
+        elif function_name == "get_user_details":
+            result = await self._tool_get_user_details(arguments, tool_context)
+        elif function_name == "send_message":
+            result = await self._tool_send_message(arguments, tool_context)
+        else:
+            raise RuntimeError(f"Unsupported tool call: {function_name}")
 
-        raise RuntimeError(f"Unsupported tool call: {function_name}")
+        LOGGER.info(
+            "Tool call success name=%s duration=%.2fs ok=%s",
+            function_name,
+            monotonic() - started_at,
+            result.get("ok"),
+        )
+        return result
 
     async def _tool_get_channel_history(
         self,
@@ -839,11 +1549,30 @@ class DiscoAssistant(discord.Client):
         message: discord.Message = tool_context["message"]
         limit = int(arguments.get("limit", self.app_config.runtime.discord.max_history_messages))
         limit = max(1, min(limit, 100))
+        requested_channel_id = arguments.get("target_channel_id")
+        target_channel = message.channel
         before_message_id = arguments.get("before_message_id", message.id)
+        if requested_channel_id is not None:
+            target_channel_id = int(requested_channel_id)
+            target_channel = self._channel_from_message_context(message, target_channel_id)
+            if target_channel is None:
+                fetched_channel = await self.fetch_channel(target_channel_id)
+                target_channel = fetched_channel
+            before_message_id = arguments.get("before_message_id")
+        LOGGER.info(
+            "Fetching channel history requester=%s target_channel_id=%s limit=%s before_message_id=%s",
+            message.author.id,
+            getattr(target_channel, "id", None),
+            limit,
+            before_message_id,
+        )
 
-        before_message = discord.Object(id=int(before_message_id))
+        if not hasattr(target_channel, "history"):
+            raise ValueError("get_channel_history target channel does not support message history.")
+
+        before_message = discord.Object(id=int(before_message_id)) if before_message_id is not None else None
         history = []
-        async for item in message.channel.history(limit=limit, before=before_message, oldest_first=False):
+        async for item in target_channel.history(limit=limit, before=before_message, oldest_first=False):
             history.append(
                 {
                     "message_id": item.id,
@@ -856,7 +1585,7 @@ class DiscoAssistant(discord.Client):
             self._store_historical_dm_message(item)
 
         return {
-            "channel_id": message.channel.id,
+            "channel_id": target_channel.id,
             "fetched_count": len(history),
             "messages": history,
         }
@@ -881,6 +1610,7 @@ class DiscoAssistant(discord.Client):
         tool_context: dict[str, Any],
     ) -> dict[str, Any]:
         message: discord.Message = tool_context["message"]
+        self._require_owner(message, "append_user_memory")
         note = str(arguments.get("note", "")).strip()
         if not note:
             raise ValueError("append_user_memory.note is required.")
@@ -904,6 +1634,7 @@ class DiscoAssistant(discord.Client):
         tool_context: dict[str, Any],
     ) -> dict[str, Any]:
         message: discord.Message = tool_context["message"]
+        self._require_owner(message, "edit_user_memory")
         old_text = str(arguments.get("old_text", "")).strip()
         new_text = str(arguments.get("new_text", "")).strip()
         if not old_text or not new_text:
@@ -923,6 +1654,30 @@ class DiscoAssistant(discord.Client):
             "status": "updated" if updated else "not_found",
         }
 
+    async def _tool_get_user_memory(
+        self,
+        arguments: dict[str, Any],
+        tool_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        message: discord.Message = tool_context["message"]
+        self._require_owner(message, "get_user_memory")
+
+        requested_target_user_id = arguments.get("target_user_id")
+        if requested_target_user_id is None:
+            raise ValueError("get_user_memory.target_user_id is required.")
+        target_user_id = self._resolve_target_user_id(message, requested_target_user_id)
+        LOGGER.info("Reading user memory requester=%s target_user_id=%s", message.author.id, target_user_id)
+
+        path = self.user_memory_store.path_for_user(target_user_id)
+        content = self.user_memory_store.read_for_user(target_user_id)
+        return {
+            "ok": True,
+            "target_user_id": target_user_id,
+            "path": str(path),
+            "exists": bool(content),
+            "memory": content or "",
+        }
+
     async def _tool_get_user_details(
         self,
         arguments: dict[str, Any],
@@ -930,7 +1685,11 @@ class DiscoAssistant(discord.Client):
     ) -> dict[str, Any]:
         message: discord.Message = tool_context["message"]
         requested_target_user_id = arguments.get("target_user_id")
-        target_user_id = int(requested_target_user_id) if requested_target_user_id is not None else message.author.id
+        target_user_id = (
+            self._resolve_target_user_id(message, requested_target_user_id)
+            if requested_target_user_id is not None
+            else message.author.id
+        )
 
         member = self._member_from_message_context(message, target_user_id)
         user = member or self._user_from_message_context(message, target_user_id)
@@ -1031,12 +1790,20 @@ class DiscoAssistant(discord.Client):
         tool_context: dict[str, Any],
     ) -> dict[str, Any]:
         message: discord.Message = tool_context["message"]
+        self._require_owner(message, "append_server_memory")
         if message.guild is None:
             raise ValueError("append_server_memory requires a guild/server channel.")
 
         note = str(arguments.get("note", "")).strip()
         if not note:
             raise ValueError("append_server_memory.note is required.")
+        LOGGER.info(
+            "Appending server memory requester=%s guild_id=%s channel_id=%s note_chars=%s",
+            message.author.id,
+            message.guild.id,
+            message.channel.id,
+            len(note),
+        )
 
         path = self.guild_memory_store.append_for_guild(
             guild_id=message.guild.id,
@@ -1044,6 +1811,16 @@ class DiscoAssistant(discord.Client):
             note=note,
             author_display_name=self._display_name_for_message_author(message),
             source_channel_id=message.channel.id,
+        )
+        await self._notify_owner_of_guild_memory_update(
+            guild_id=message.guild.id,
+            guild_name=message.guild.name,
+            summary=(
+                "Owner-approved guild memory append:\n"
+                f"- channel_id: {message.channel.id}\n"
+                f"- author: {self._display_name_for_message_author(message)}\n"
+                f"- note: {note}"
+            ),
         )
         return {
             "ok": True,
@@ -1059,6 +1836,7 @@ class DiscoAssistant(discord.Client):
         tool_context: dict[str, Any],
     ) -> dict[str, Any]:
         message: discord.Message = tool_context["message"]
+        self._require_owner(message, "edit_server_memory")
         if message.guild is None:
             raise ValueError("edit_server_memory requires a guild/server channel.")
 
@@ -1066,12 +1844,29 @@ class DiscoAssistant(discord.Client):
         new_text = str(arguments.get("new_text", "")).strip()
         if not old_text or not new_text:
             raise ValueError("edit_server_memory.old_text and new_text are required.")
+        LOGGER.info(
+            "Editing server memory requester=%s guild_id=%s old_chars=%s new_chars=%s",
+            message.author.id,
+            message.guild.id,
+            len(old_text),
+            len(new_text),
+        )
 
         path, updated = self.guild_memory_store.replace_for_guild(
             guild_id=message.guild.id,
             old_text=old_text,
             new_text=new_text,
         )
+        if updated:
+            await self._notify_owner_of_guild_memory_update(
+                guild_id=message.guild.id,
+                guild_name=message.guild.name,
+                summary=(
+                    "Owner-approved guild memory edit:\n"
+                    f"- old: {old_text}\n"
+                    f"- new: {new_text}"
+                ),
+            )
         return {
             "ok": updated,
             "guild_id": message.guild.id,
@@ -1081,6 +1876,28 @@ class DiscoAssistant(discord.Client):
             "new_text": new_text,
             "status": "updated" if updated else "not_found",
         }
+
+    async def _tool_flush_passive_server_memory(
+        self,
+        arguments: dict[str, Any],
+        tool_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        message: discord.Message = tool_context["message"]
+        self._require_owner(message, "flush_passive_server_memory")
+
+        requested_guild_id = arguments.get("guild_id")
+        if requested_guild_id is None:
+            if message.guild is None:
+                raise ValueError("flush_passive_server_memory.guild_id is required outside a guild channel.")
+            guild_id = message.guild.id
+        else:
+            guild_id = int(requested_guild_id)
+        LOGGER.info("Forcing passive server memory flush requester=%s guild_id=%s", message.author.id, guild_id)
+
+        if not self._passive_guild_enabled_for_guild(guild_id):
+            raise ValueError(f"Passive guild memory is not enabled for guild_id={guild_id}.")
+
+        return await self._flush_passive_guild_memory_now(guild_id)
 
     async def _tool_send_message(
         self,
@@ -1095,7 +1912,7 @@ class DiscoAssistant(discord.Client):
         requested_target_user_id = arguments.get("target_user_id")
         if requested_target_user_id is None:
             raise ValueError("send_message.target_user_id is required. Do not guess recipient.")
-        target_user_id = int(requested_target_user_id)
+        target_user_id = self._resolve_target_user_id(message, requested_target_user_id)
 
         content = str(arguments.get("message", "")).strip()
         if not content:
@@ -1125,10 +1942,68 @@ class DiscoAssistant(discord.Client):
             "sent_message": content,
         }
 
+    def _require_owner(self, message: discord.Message, tool_name: str) -> None:
+        if message.author.id != self.app_config.settings.owner_user_id:
+            raise ValueError(f"{tool_name} is restricted to the owner.")
+
+    def _resolve_target_user_id(self, message: discord.Message, raw_value: Any) -> int:
+        if isinstance(raw_value, int):
+            return raw_value
+
+        if isinstance(raw_value, str):
+            value = raw_value.strip()
+            if not value:
+                raise ValueError("target_user_id cannot be empty.")
+            if value.isdigit():
+                return int(value)
+
+            mention_match = re.fullmatch(r"<@!?(\d+)>", value)
+            if mention_match:
+                return int(mention_match.group(1))
+
+            normalized = value.casefold()
+            for user in getattr(message, "mentions", []):
+                candidates = {
+                    str(user).casefold(),
+                    getattr(user, "name", str(user)).casefold(),
+                    getattr(user, "display_name", str(user)).casefold(),
+                    getattr(user, "global_name", "") .casefold(),
+                    getattr(user, "mention", "").casefold(),
+                }
+                if normalized in candidates:
+                    return int(user.id)
+
+        raise ValueError(
+            "Could not resolve target_user_id. Use a numeric user id or mention the user explicitly in the message."
+        )
+
     def _user_memory_context_for_message(self, message: discord.Message) -> str:
         if not self.app_config.runtime.memory.enabled:
             return ""
         return self.user_memory_store.read_for_prompt(message.author.id)
+
+    async def _notify_owner_of_guild_memory_update(
+        self,
+        *,
+        guild_id: int,
+        guild_name: str,
+        summary: str,
+    ) -> None:
+        owner_user_id = self.app_config.settings.owner_user_id
+        user = self.get_user(owner_user_id)
+        if user is None:
+            user = await self.fetch_user(owner_user_id)
+
+        dm_channel = user.dm_channel
+        if dm_channel is None:
+            dm_channel = await user.create_dm()
+
+        content = (
+            f"Guild memory updated for {guild_name} ({guild_id}).\n"
+            f"{summary.strip()}"
+        ).strip()
+        sent_message = await dm_channel.send(content, silent=True)
+        self._store_outgoing_dm_message(sent_message)
 
     def _server_memory_context_for_message(self, message: discord.Message) -> str:
         if not self.app_config.runtime.memory.enabled:
@@ -1248,7 +2123,7 @@ class DiscoAssistant(discord.Client):
                     "function": {
                         "name": "get_channel_history",
                         "description": (
-                            "Fetch past messages from current Discord channel for context. "
+                            "Fetch past messages from the current Discord channel or an explicitly referenced channel for context. "
                             "Use default limit unless more context is needed. To paginate farther "
                             "back, call again with a smaller before_message_id from an older message."
                         ),
@@ -1269,6 +2144,12 @@ class DiscoAssistant(discord.Client):
                                     "description": (
                                         "Fetch messages before this message id. "
                                         "Use returned older message ids to paginate farther back."
+                                    ),
+                                },
+                                "target_channel_id": {
+                                    "type": "integer",
+                                    "description": (
+                                        "Optional explicit Discord channel id. Use this when the user mentions a specific #channel."
                                     ),
                                 },
                             },
@@ -1337,6 +2218,32 @@ class DiscoAssistant(discord.Client):
                 }
             )
 
+        if "get_user_memory" in allowed:
+            schemas.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_user_memory",
+                        "description": (
+                            "Owner-only: read the persistent user memory file for a specific Discord user id."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "target_user_id": {
+                                    "type": "integer",
+                                    "description": (
+                                        "Discord user id whose memory file should be read."
+                                    ),
+                                }
+                            },
+                            "required": ["target_user_id"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            )
+
         if "append_server_memory" in allowed:
             schemas.append(
                 {
@@ -1344,9 +2251,8 @@ class DiscoAssistant(discord.Client):
                     "function": {
                         "name": "append_server_memory",
                         "description": (
-                            "Append shared durable notes about current Discord server to that server's markdown memory file. "
-                            "Use for small preferences, running jokes, local conventions, recurring relationships, "
-                            "or any server-level detail likely to help later, even if nobody explicitly asked you to remember it."
+                            "Owner-only: append a server-wide rule, policy, or durable guild fact to the current server memory. "
+                            "Use this for instructions from the real owner that should apply across the whole server, not just to the owner."
                         ),
                         "parameters": {
                             "type": "object",
@@ -1372,8 +2278,7 @@ class DiscoAssistant(discord.Client):
                     "function": {
                         "name": "edit_server_memory",
                         "description": (
-                            "Update stale or changed facts inside current server's markdown memory file by replacing "
-                            "specific old text with new text."
+                            "Owner-only: update stale or changed server-wide rules or facts inside current server memory."
                         ),
                         "parameters": {
                             "type": "object",
@@ -1388,6 +2293,33 @@ class DiscoAssistant(discord.Client):
                                 },
                             },
                             "required": ["old_text", "new_text"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            )
+
+        if "flush_passive_server_memory" in allowed:
+            schemas.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "flush_passive_server_memory",
+                        "description": (
+                            "Owner-only: force the passive guild memory queue to summarize now for the current server, "
+                            "or for an explicit guild id."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "guild_id": {
+                                    "type": "integer",
+                                    "description": (
+                                        "Optional guild/server id. Leave unset in a server channel to use the current guild."
+                                    ),
+                                }
+                            },
+                            "required": [],
                             "additionalProperties": False,
                         },
                     },
@@ -1520,6 +2452,7 @@ class DiscoAssistant(discord.Client):
         self._active_conversations[self._conversation_key(message)] = ActiveConversation(
             messages=conversation_messages,
             expires_at=monotonic() + self.app_config.runtime.discord.conversation_window_seconds,
+            interrupted_by_other_user=False,
         )
 
     def _append_passive_channel_context(self, message: discord.Message) -> None:
@@ -1555,6 +2488,7 @@ class DiscoAssistant(discord.Client):
             )
             conversation.messages = conversation.messages[-12:]
             conversation.expires_at = monotonic() + self.app_config.runtime.discord.conversation_window_seconds
+            conversation.interrupted_by_other_user = True
 
     @staticmethod
     def _conversation_key(message: discord.Message) -> tuple[int, int]:
@@ -1642,6 +2576,74 @@ class DiscoAssistant(discord.Client):
                 f"- username: {user} | display_name: {getattr(user, 'display_name', str(user))} | user_id: {user.id}"
             )
         return "\n".join(lines) + "\n"
+
+    def _mentioned_channels_context(self, message: discord.Message) -> str:
+        channel_mentions = getattr(message, "channel_mentions", [])
+        if not channel_mentions:
+            return "Mentioned channels: none\n"
+
+        lines = ["Mentioned channels:"]
+        for channel in channel_mentions:
+            lines.append(
+                f"- channel_name: #{getattr(channel, 'name', 'unknown')} | channel_id: {channel.id}"
+            )
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _channel_from_message_context(
+        message: discord.Message,
+        channel_id: int,
+    ) -> discord.abc.MessageableChannel | None:
+        if getattr(message.channel, "id", None) == channel_id:
+            return message.channel
+        for channel in getattr(message, "channel_mentions", []):
+            if channel.id == channel_id:
+                return channel
+        guild = getattr(message, "guild", None)
+        if guild is not None:
+            return guild.get_channel(channel_id)
+        return None
+
+    async def _reply_reference_context(self, message: discord.Message) -> str:
+        reference = getattr(message, "reference", None)
+        if reference is None:
+            return "Reply target: none\n"
+
+        referenced_message = await self._resolve_referenced_message(message)
+        if referenced_message is None:
+            message_id = getattr(reference, "message_id", None)
+            return f"Reply target: unresolved message_id={message_id}\n"
+
+        author_name = self._display_name_for_message_author(referenced_message)
+        content = (referenced_message.content or "").strip() or "(no text)"
+        return (
+            "Reply target:\n"
+            f"- author: {author_name}\n"
+            f"- message_id: {referenced_message.id}\n"
+            f"- content: {content}\n"
+        )
+
+    async def _resolve_referenced_message(self, message: discord.Message) -> discord.Message | None:
+        reference = getattr(message, "reference", None)
+        if reference is None:
+            return None
+
+        resolved = getattr(reference, "resolved", None)
+        if isinstance(resolved, discord.Message):
+            return resolved
+
+        message_id = getattr(reference, "message_id", None)
+        if message_id is None:
+            return None
+
+        channel = getattr(message, "channel", None)
+        if channel is None or not hasattr(channel, "fetch_message"):
+            return None
+
+        try:
+            return await channel.fetch_message(message_id)
+        except discord.HTTPException:
+            return None
 
     async def _owner_context_prompt(self, message: discord.Message) -> str:
         if self._owner_context_prompt_cache is not None:
@@ -1823,10 +2825,25 @@ bot: DiscoAssistant | None = None
 def main() -> None:
     global bot
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    log_format = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.handlers.clear()
+
+    formatter = logging.Formatter(log_format)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+
+    file_handler = RotatingFileHandler(
+        BASE_DIR / "discoassistant.runtime.log",
+        maxBytes=2_000_000,
+        backupCount=5,
+        encoding="utf-8",
     )
+    file_handler.setFormatter(formatter)
+
+    root_logger.addHandler(stream_handler)
+    root_logger.addHandler(file_handler)
 
     app_config = load_app_config()
     bot = DiscoAssistant(app_config)

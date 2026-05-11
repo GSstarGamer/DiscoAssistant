@@ -66,6 +66,19 @@ class MemoryConfig(BaseModel):
     max_guild_chars_in_prompt: int = 6000
 
 
+class PassiveGuildMemoryConfig(BaseModel):
+    enabled: bool = False
+    db_path: str = "memories/guild_passive.sqlite3"
+    primary_model: str = "nvidia/nemotron-3-super-120b-a12b:free"
+    fallback_model: str | None = "openrouter/free"
+    effective_context_limit_tokens: int = 262144
+    flush_ratio: float = 0.8
+    max_output_tokens: int = 1800
+    temperature: float = 0.2
+    poll_interval_seconds: int = 15
+    enabled_guild_ids: list[int] | None = None
+
+
 class OpenRouterConfig(BaseModel):
     base_url: str = "https://openrouter.ai/api/v1"
     default_model: str = "google/gemma-4-31b-it"
@@ -78,6 +91,7 @@ class RuntimeConfig(BaseModel):
 
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    passive_guild_memory: PassiveGuildMemoryConfig = Field(default_factory=PassiveGuildMemoryConfig)
     openrouter: OpenRouterConfig = Field(default_factory=OpenRouterConfig)
     tool_policy: ToolPolicy = Field(default_factory=ToolPolicy)
     prompts: dict[str, str] = Field(default_factory=dict)
