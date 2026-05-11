@@ -39,6 +39,13 @@ class DiscordConfig(BaseModel):
     respond_to_bots: bool = False
     max_history_messages: int = 20
     conversation_window_seconds: int = 10
+    reply_debounce_seconds: float = 2.5
+
+
+class MemoryConfig(BaseModel):
+    enabled: bool = True
+    directory: str = "memories/users"
+    max_chars_in_prompt: int = 6000
 
 
 class OpenRouterConfig(BaseModel):
@@ -52,6 +59,7 @@ class RuntimeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
     openrouter: OpenRouterConfig = Field(default_factory=OpenRouterConfig)
     tool_policy: ToolPolicy = Field(default_factory=ToolPolicy)
     prompts: dict[str, str] = Field(default_factory=dict)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections import deque
@@ -11,7 +12,8 @@ from collections.abc import Iterable
 import aiohttp
 import discord
 
-from discoassistant.config import AppConfig, load_app_config
+from discoassistant.config import BASE_DIR, AppConfig, load_app_config
+from discoassistant.memory import UserMemoryStore
 
 
 LOGGER = logging.getLogger("discoassistant")
@@ -23,6 +25,16 @@ class ActiveConversation:
     expires_at: float = 0.0
 
 
+@dataclass(slots=True)
+class PendingReply:
+    message: discord.Message
+    updated_at: float
+    first_seen_at: float
+    started_from_mention: bool
+    started_from_active_conversation: bool
+    messages: list[discord.Message] = field(default_factory=list)
+
+
 class DiscoAssistant(discord.Client):
     def __init__(self, app_config: AppConfig) -> None:
         super().__init__()
@@ -31,6 +43,13 @@ class DiscoAssistant(discord.Client):
         self.http_session: aiohttp.ClientSession | None = None
         self._recent_response_ids: deque[int] = deque(maxlen=200)
         self._active_conversations: dict[tuple[int, int], ActiveConversation] = {}
+        self._pending_replies: dict[tuple[int, int], PendingReply] = {}
+        self._reply_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
+        self._reply_generation_in_progress: set[tuple[int, int]] = set()
+        self.user_memory_store = UserMemoryStore(
+            base_dir=BASE_DIR / self.app_config.runtime.memory.directory,
+            max_chars_in_prompt=self.app_config.runtime.memory.max_chars_in_prompt,
+        )
 
     async def setup_hook(self) -> None:
         headers = {
@@ -65,25 +84,37 @@ class DiscoAssistant(discord.Client):
         print(f"DiscoAssistant is ready as {self.user}")
 
     async def on_message(self, message: discord.Message) -> None:
-        should_respond = self._should_respond_to_message(message)
-        if not should_respond and self._has_active_conversation(message):
-            should_respond = await self._should_treat_active_conversation_message_as_follow_up(message)
+        self._append_passive_channel_context(message)
 
-        if not should_respond:
+        if not self._should_consider_message(message):
             return
 
-        try:
-            self._recent_response_ids.append(message.id)
-            async with message.channel.typing():
-                reply_text = await self.generate_reply_for_message(message)
-            await message.channel.send(reply_text, reference=message)
-        except Exception:
-            LOGGER.exception("Failed to generate or send reply for message %s", message.id)
-            await message.channel.send(
-                "I am DiscoAssistant, a Discord assistant. Something went wrong while I was thinking."
-            )
+        is_direct_mention = self._should_respond_to_message(message)
+        has_active_conversation = self._has_active_conversation(message)
+        has_pending_reply = self._has_pending_reply(message)
+        if (
+            not is_direct_mention
+            and not has_active_conversation
+            and not has_pending_reply
+        ):
+            return
+
+        LOGGER.info(
+            "tracked message id=%s channel=%s author=%s mention=%s active=%s pending=%s content=%r",
+            message.id,
+            message.channel.id,
+            message.author.id,
+            is_direct_mention,
+            has_active_conversation,
+            has_pending_reply,
+            message.content,
+        )
+        self._queue_reply_attempt(message)
 
     async def close(self) -> None:
+        for task in self._reply_tasks.values():
+            if not task.done():
+                task.cancel()
         if self.http_session is not None and not self.http_session.closed:
             await self.http_session.close()
         await super().close()
@@ -113,6 +144,11 @@ class DiscoAssistant(discord.Client):
             return await response.json()
 
     def _should_respond_to_message(self, message: discord.Message) -> bool:
+        if not self._should_consider_message(message):
+            return False
+        return any(user.id == self.user.id for user in self._iter_mentions(message))
+
+    def _should_consider_message(self, message: discord.Message) -> bool:
         if self.user is None:
             return False
 
@@ -125,18 +161,24 @@ class DiscoAssistant(discord.Client):
         if message.author.bot and not self.app_config.runtime.discord.respond_to_bots:
             return False
 
-        return any(user.id == self.user.id for user in self._iter_mentions(message))
+        return True
 
     @staticmethod
     def _iter_mentions(message: discord.Message) -> Iterable[discord.abc.User]:
         return getattr(message, "mentions", [])
 
-    async def generate_reply_for_message(self, message: discord.Message) -> str:
+    async def generate_reply_for_message(
+        self,
+        message: discord.Message,
+        pending_messages: list[discord.Message] | None = None,
+    ) -> str:
+        LOGGER.info("generate_reply_for_message start id=%s", message.id)
         selected_agent = self._agent_for_message(message)
         prompt_parts = [
             self.app_config.runtime.prompts.get("shared_base", ""),
             self.app_config.runtime.prompts.get("response_style", ""),
             self.app_config.runtime.prompts.get("tool_rules", ""),
+            self.app_config.runtime.prompts.get("memory_rules", ""),
             self.app_config.runtime.prompts.get("safety", ""),
             selected_agent.system_prompt,
         ]
@@ -146,6 +188,8 @@ class DiscoAssistant(discord.Client):
         prefetched_channel_context = ""
         if mention_only:
             prefetched_channel_context = await self._prefetch_channel_history_for_message(message)
+        memory_context = self._user_memory_context_for_message(message)
+        pending_burst_context = self._pending_burst_context(pending_messages, latest_message_id=message.id)
 
         messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
         if conversation is not None:
@@ -161,6 +205,9 @@ class DiscoAssistant(discord.Client):
                 f"Author display name: {self._display_name_for_message_author(message)}\n"
                 f"Channel message: {message.content.strip()}\n"
                 "If this is a mention-only message, do not send a generic greeting. Use recent channel history to infer what the user is asking and answer that directly.\n"
+                "Always answer the latest user message, not an older one. If the latest message contains multiple questions, requests, or lines, address all of them in your reply.\n"
+                f"{pending_burst_context}"
+                f"{memory_context}"
                 f"{prefetched_channel_context}"
                 "Keep it short."
             ),
@@ -185,6 +232,7 @@ class DiscoAssistant(discord.Client):
             },
         )
         reply_text = self.extract_response_text(response)
+        LOGGER.info("generate_reply_for_message done id=%s", message.id)
         self._store_active_conversation(
             message=message,
             prior_conversation=conversation,
@@ -192,6 +240,144 @@ class DiscoAssistant(discord.Client):
             assistant_reply=reply_text,
         )
         return reply_text
+
+    def _queue_reply_attempt(self, message: discord.Message) -> None:
+        key = self._conversation_key(message)
+        now = monotonic()
+        pending = self._pending_replies.get(key)
+        is_direct_mention = self._should_respond_to_message(message)
+        has_active_conversation = self._has_active_conversation(message)
+        if pending is None:
+            first_seen_at = now
+            started_from_mention = is_direct_mention
+            started_from_active_conversation = has_active_conversation
+            pending_messages = [message]
+        else:
+            first_seen_at = pending.first_seen_at
+            started_from_mention = pending.started_from_mention or is_direct_mention
+            started_from_active_conversation = (
+                pending.started_from_active_conversation or has_active_conversation
+            )
+            pending_messages = [*pending.messages, message][-8:]
+
+        self._pending_replies[key] = PendingReply(
+            message=message,
+            updated_at=now,
+            first_seen_at=first_seen_at,
+            started_from_mention=started_from_mention,
+            started_from_active_conversation=started_from_active_conversation,
+            messages=pending_messages,
+        )
+        LOGGER.info(
+            "pending reply updated key=%s message_id=%s updated_at=%.3f first_seen_at=%.3f started_from_mention=%s started_from_active=%s buffered=%s",
+            key,
+            message.id,
+            now,
+            first_seen_at,
+            started_from_mention,
+            started_from_active_conversation,
+            len(pending_messages),
+        )
+
+        existing_task = self._reply_tasks.get(key)
+        if existing_task is not None and not existing_task.done():
+            if key in self._reply_generation_in_progress:
+                LOGGER.info("cancel in-flight generation key=%s for newer message_id=%s", key, message.id)
+                existing_task.cancel()
+                self._reply_tasks[key] = asyncio.create_task(self._process_pending_reply(key))
+                LOGGER.info("spawned replacement reply task key=%s", key)
+            else:
+                LOGGER.info("reuse existing debounce task key=%s latest_message_id=%s", key, message.id)
+            return
+
+        self._reply_tasks[key] = asyncio.create_task(self._process_pending_reply(key))
+        LOGGER.info("spawned new reply task key=%s message_id=%s", key, message.id)
+
+    async def _process_pending_reply(self, key: tuple[int, int]) -> None:
+        try:
+            LOGGER.info("reply task start key=%s", key)
+            message = await self._wait_until_user_idle(key)
+            if message is None:
+                LOGGER.info("reply task exit key=%s reason=no_pending_message", key)
+                return
+
+            LOGGER.info("debounce finished key=%s message_id=%s", key, message.id)
+            pending = self._pending_replies.get(key)
+            pending_messages = pending.messages if pending is not None else [message]
+            should_respond = self._should_respond_to_message(message)
+            if not should_respond and pending is not None and pending.started_from_mention:
+                LOGGER.info("reply task treating key=%s message_id=%s as pending mention follow-up", key, message.id)
+                should_respond = True
+            if not should_respond and pending is not None and pending.started_from_active_conversation:
+                LOGGER.info("reply task treating key=%s message_id=%s as active-conversation burst", key, message.id)
+                should_respond = True
+            if not should_respond and self._has_active_conversation(message):
+                LOGGER.info("checking follow-up classifier key=%s message_id=%s", key, message.id)
+                should_respond = await self._should_treat_active_conversation_message_as_follow_up(message)
+
+            if not should_respond:
+                LOGGER.info("reply task exit key=%s message_id=%s reason=should_not_respond", key, message.id)
+                return
+
+            self._reply_generation_in_progress.add(key)
+            self._recent_response_ids.append(message.id)
+            LOGGER.info("start generation key=%s message_id=%s", key, message.id)
+            async with message.channel.typing():
+                reply_text = await self.generate_reply_for_message(message, pending_messages)
+            LOGGER.info("generation done key=%s message_id=%s reply=%r", key, message.id, reply_text)
+            await message.channel.send(reply_text, reference=message)
+            LOGGER.info("reply sent key=%s message_id=%s", key, message.id)
+        except asyncio.CancelledError:
+            LOGGER.info("reply task cancelled key=%s", key)
+            raise
+        except Exception:
+            pending = self._pending_replies.get(key)
+            message = pending.message if pending is not None else None
+            if message is not None:
+                LOGGER.exception("Failed to generate or send reply for message %s", message.id)
+                await message.channel.send(
+                    "I am DiscoAssistant, a Discord assistant. Something went wrong while I was thinking."
+                )
+            else:
+                LOGGER.exception("Failed to generate or send reply for conversation %s", key)
+        finally:
+            current_task = asyncio.current_task()
+            self._reply_generation_in_progress.discard(key)
+            if self._reply_tasks.get(key) is current_task:
+                self._reply_tasks.pop(key, None)
+                self._pending_replies.pop(key, None)
+                LOGGER.info("reply task cleanup key=%s removed_task=yes", key)
+            else:
+                LOGGER.info("reply task cleanup key=%s removed_task=no", key)
+
+    async def _wait_until_user_idle(self, key: tuple[int, int]) -> discord.Message | None:
+        config = self.app_config.runtime.discord
+
+        while True:
+            pending = self._pending_replies.get(key)
+            if pending is None:
+                return None
+
+            now = monotonic()
+            debounce_ready_at = pending.updated_at + config.reply_debounce_seconds
+            if now >= debounce_ready_at:
+                LOGGER.info(
+                    "debounce ready key=%s message_id=%s now=%.3f ready_at=%.3f",
+                    key,
+                    pending.message.id,
+                    now,
+                    debounce_ready_at,
+                )
+                return pending.message
+
+            sleep_for = max(0.05, debounce_ready_at - now)
+            LOGGER.info(
+                "debounce wait key=%s current_message_id=%s sleep=%.3f",
+                key,
+                pending.message.id,
+                sleep_for,
+            )
+            await asyncio.sleep(sleep_for)
 
     async def _run_chat_with_tools_if_needed(
         self,
@@ -309,6 +495,10 @@ class DiscoAssistant(discord.Client):
 
         if function_name == "get_channel_history":
             return await self._tool_get_channel_history(arguments, tool_context)
+        if function_name == "append_user_memory":
+            return await self._tool_append_user_memory(arguments, tool_context)
+        if function_name == "edit_user_memory":
+            return await self._tool_edit_user_memory(arguments, tool_context)
 
         raise RuntimeError(f"Unsupported tool call: {function_name}")
 
@@ -352,6 +542,78 @@ class DiscoAssistant(discord.Client):
             author_name = item.get("author_display_name") or item.get("author_username") or "unknown"
             content = (item.get("content") or "").strip() or "(no text)"
             lines.append(f"- {author_name}: {content}")
+        lines.append("")
+        return "\n".join(lines)
+
+    async def _tool_append_user_memory(
+        self,
+        arguments: dict[str, Any],
+        tool_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        message: discord.Message = tool_context["message"]
+        note = str(arguments.get("note", "")).strip()
+        if not note:
+            raise ValueError("append_user_memory.note is required.")
+
+        path = self.user_memory_store.append_for_user(
+            user_id=message.author.id,
+            note=note,
+            author_display_name=self._display_name_for_message_author(message),
+            source_channel_id=message.channel.id,
+        )
+        return {
+            "ok": True,
+            "user_id": message.author.id,
+            "path": str(path),
+            "appended_note": note,
+        }
+
+    async def _tool_edit_user_memory(
+        self,
+        arguments: dict[str, Any],
+        tool_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        message: discord.Message = tool_context["message"]
+        old_text = str(arguments.get("old_text", "")).strip()
+        new_text = str(arguments.get("new_text", "")).strip()
+        if not old_text or not new_text:
+            raise ValueError("edit_user_memory.old_text and new_text are required.")
+
+        path, updated = self.user_memory_store.replace_for_user(
+            user_id=message.author.id,
+            old_text=old_text,
+            new_text=new_text,
+        )
+        return {
+            "ok": updated,
+            "user_id": message.author.id,
+            "path": str(path),
+            "old_text": old_text,
+            "new_text": new_text,
+            "status": "updated" if updated else "not_found",
+        }
+
+    def _user_memory_context_for_message(self, message: discord.Message) -> str:
+        if not self.app_config.runtime.memory.enabled:
+            return ""
+        return self.user_memory_store.read_for_prompt(message.author.id)
+
+    def _pending_burst_context(
+        self,
+        pending_messages: list[discord.Message] | None,
+        *,
+        latest_message_id: int,
+    ) -> str:
+        if not pending_messages or len(pending_messages) <= 1:
+            return ""
+
+        lines = [
+            "Pre-reply message burst from same user in this channel. Treat these together as one request:"
+        ]
+        for item in pending_messages:
+            marker = "latest" if item.id == latest_message_id else "earlier"
+            content = item.content.strip() or "(no text)"
+            lines.append(f"- {marker}: {content}")
         lines.append("")
         return "\n".join(lines)
 
@@ -405,6 +667,64 @@ class DiscoAssistant(discord.Client):
                 }
             )
 
+        if "append_user_memory" in allowed:
+            schemas.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "append_user_memory",
+                        "description": (
+                            "Append durable notes about current Discord user to that user's markdown memory file. "
+                            "Use for useful long-term facts, preferences, plans, personal context, repeated habits, "
+                            "or even small details likely to help in future conversations."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "note": {
+                                    "type": "string",
+                                    "description": (
+                                        "Short markdown-safe note to append to this user's memory file. "
+                                        "Write concrete facts, preferences, or context worth remembering."
+                                    ),
+                                }
+                            },
+                            "required": ["note"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            )
+
+        if "edit_user_memory" in allowed:
+            schemas.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "edit_user_memory",
+                        "description": (
+                            "Update stale or changed facts inside current user's markdown memory file by replacing "
+                            "specific old text with new text. Use when existing memory is wrong, outdated, or changed."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "old_text": {
+                                    "type": "string",
+                                    "description": "Exact existing text snippet from user memory that should be replaced.",
+                                },
+                                "new_text": {
+                                    "type": "string",
+                                    "description": "New replacement text that should overwrite old_text.",
+                                },
+                            },
+                            "required": ["old_text", "new_text"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            )
+
         return schemas
 
     def _tool_choice_for_message(self, message: discord.Message) -> str | dict[str, Any]:
@@ -420,6 +740,11 @@ class DiscoAssistant(discord.Client):
     def _has_active_conversation(self, message: discord.Message) -> bool:
         return self._get_active_conversation(message) is not None
 
+    def _has_pending_reply(self, message: discord.Message) -> bool:
+        key = self._conversation_key(message)
+        task = self._reply_tasks.get(key)
+        return key in self._pending_replies or (task is not None and not task.done())
+
     def _get_active_conversation(self, message: discord.Message) -> ActiveConversation | None:
         key = self._conversation_key(message)
         conversation = self._active_conversations.get(key)
@@ -431,6 +756,18 @@ class DiscoAssistant(discord.Client):
             return None
 
         return conversation
+
+    def _active_conversation_keys_for_channel(self, channel_id: int) -> list[tuple[int, int]]:
+        keys: list[tuple[int, int]] = []
+        now = monotonic()
+        for key, conversation in list(self._active_conversations.items()):
+            if key[0] != channel_id:
+                continue
+            if conversation.expires_at <= now:
+                del self._active_conversations[key]
+                continue
+            keys.append(key)
+        return keys
 
     def _store_active_conversation(
         self,
@@ -452,6 +789,40 @@ class DiscoAssistant(discord.Client):
             messages=conversation_messages,
             expires_at=monotonic() + self.app_config.runtime.discord.conversation_window_seconds,
         )
+
+    def _append_passive_channel_context(self, message: discord.Message) -> None:
+        if self.user is None:
+            return
+
+        if message.author.id == self.user.id:
+            return
+
+        content = message.content.strip()
+        if not content:
+            return
+
+        for key in self._active_conversation_keys_for_channel(message.channel.id):
+            if key[1] == message.author.id:
+                continue
+
+            conversation = self._active_conversations.get(key)
+            if conversation is None:
+                continue
+
+            conversation.messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Channel context update from another user. This message was not directed at you, "
+                        "but happened in same channel during active conversation.\n"
+                        f"Author username: {message.author}\n"
+                        f"Author display name: {self._display_name_for_message_author(message)}\n"
+                        f"Channel message: {content}"
+                    ),
+                }
+            )
+            conversation.messages = conversation.messages[-12:]
+            conversation.expires_at = monotonic() + self.app_config.runtime.discord.conversation_window_seconds
 
     @staticmethod
     def _conversation_key(message: discord.Message) -> tuple[int, int]:
