@@ -38,6 +38,7 @@ class AgentDefinition(BaseModel):
 class DiscordConfig(BaseModel):
     respond_to_bots: bool = False
     max_history_messages: int = 20
+    conversation_window_seconds: int = 10
 
 
 class OpenRouterConfig(BaseModel):
