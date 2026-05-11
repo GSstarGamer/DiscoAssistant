@@ -4,3 +4,7 @@ __pycache__/
 .venv/
 venv/
 memories/users/*.md
+memories/guilds/*.md
+memories/*.sqlite3
+*.stdout.log
+*.stderr.log

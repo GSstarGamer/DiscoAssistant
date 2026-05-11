@@ -44,8 +44,11 @@ class DiscordConfig(BaseModel):
 
 class MemoryConfig(BaseModel):
     enabled: bool = True
-    directory: str = "memories/users"
-    max_chars_in_prompt: int = 6000
+    user_directory: str = "memories/users"
+    guild_directory: str = "memories/guilds"
+    dm_history_db_path: str = "memories/dm_history.sqlite3"
+    max_user_chars_in_prompt: int = 6000
+    max_guild_chars_in_prompt: int = 6000
 
 
 class OpenRouterConfig(BaseModel):

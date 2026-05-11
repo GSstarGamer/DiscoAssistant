@@ -13,7 +13,8 @@ import aiohttp
 import discord
 
 from discoassistant.config import BASE_DIR, AppConfig, load_app_config
-from discoassistant.memory import UserMemoryStore
+from discoassistant.dm_history import DmHistoryStore
+from discoassistant.memory import GuildMemoryStore, UserMemoryStore
 
 
 LOGGER = logging.getLogger("discoassistant")
@@ -41,14 +42,22 @@ class DiscoAssistant(discord.Client):
         self.app_config = app_config
         self._startup_announced = False
         self.http_session: aiohttp.ClientSession | None = None
+        self._owner_context_prompt_cache: str | None = None
         self._recent_response_ids: deque[int] = deque(maxlen=200)
         self._active_conversations: dict[tuple[int, int], ActiveConversation] = {}
         self._pending_replies: dict[tuple[int, int], PendingReply] = {}
         self._reply_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
         self._reply_generation_in_progress: set[tuple[int, int]] = set()
         self.user_memory_store = UserMemoryStore(
-            base_dir=BASE_DIR / self.app_config.runtime.memory.directory,
-            max_chars_in_prompt=self.app_config.runtime.memory.max_chars_in_prompt,
+            base_dir=BASE_DIR / self.app_config.runtime.memory.user_directory,
+            max_chars_in_prompt=self.app_config.runtime.memory.max_user_chars_in_prompt,
+        )
+        self.guild_memory_store = GuildMemoryStore(
+            base_dir=BASE_DIR / self.app_config.runtime.memory.guild_directory,
+            max_chars_in_prompt=self.app_config.runtime.memory.max_guild_chars_in_prompt,
+        )
+        self.dm_history_store = DmHistoryStore(
+            db_path=BASE_DIR / self.app_config.runtime.memory.dm_history_db_path,
         )
 
     async def setup_hook(self) -> None:
@@ -88,6 +97,8 @@ class DiscoAssistant(discord.Client):
 
         if not self._should_consider_message(message):
             return
+
+        self._store_incoming_dm_message(message)
 
         is_direct_mention = self._should_respond_to_message(message)
         has_active_conversation = self._has_active_conversation(message)
@@ -136,16 +147,55 @@ class DiscoAssistant(discord.Client):
         if extra_payload:
             payload.update(extra_payload)
 
-        async with self.http_session.post(
-            f"{self.app_config.runtime.openrouter.base_url}/chat/completions",
-            json=payload,
-        ) as response:
-            response.raise_for_status()
-            return await response.json()
+        max_attempts = 4
+        last_error: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                async with self.http_session.post(
+                    f"{self.app_config.runtime.openrouter.base_url}/chat/completions",
+                    json=payload,
+                ) as response:
+                    response.raise_for_status()
+                    return await response.json()
+            except aiohttp.ClientResponseError as exc:
+                last_error = exc
+                should_retry = exc.status in {429, 500, 502, 503, 504} and attempt < max_attempts
+                if not should_retry:
+                    raise
+
+                retry_after = self._retry_after_seconds(exc.headers)
+                delay = retry_after if retry_after is not None else min(8.0, 1.5 * (2 ** (attempt - 1)))
+                LOGGER.warning(
+                    "OpenRouter request failed status=%s attempt=%s/%s retry_in=%.2fs",
+                    exc.status,
+                    attempt,
+                    max_attempts,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+            except aiohttp.ClientError as exc:
+                last_error = exc
+                if attempt >= max_attempts:
+                    raise
+                delay = min(8.0, 1.0 * (2 ** (attempt - 1)))
+                LOGGER.warning(
+                    "OpenRouter network error attempt=%s/%s retry_in=%.2fs error=%s",
+                    attempt,
+                    max_attempts,
+                    delay,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("OpenRouter request failed without a captured exception.")
 
     def _should_respond_to_message(self, message: discord.Message) -> bool:
         if not self._should_consider_message(message):
             return False
+        if message.guild is None:
+            return True
         return any(user.id == self.user.id for user in self._iter_mentions(message))
 
     def _should_consider_message(self, message: discord.Message) -> bool:
@@ -174,45 +224,80 @@ class DiscoAssistant(discord.Client):
     ) -> str:
         LOGGER.info("generate_reply_for_message start id=%s", message.id)
         selected_agent = self._agent_for_message(message)
+        owner_context_prompt = await self._owner_context_prompt(message)
         prompt_parts = [
             self.app_config.runtime.prompts.get("shared_base", ""),
             self.app_config.runtime.prompts.get("response_style", ""),
             self.app_config.runtime.prompts.get("tool_rules", ""),
             self.app_config.runtime.prompts.get("memory_rules", ""),
             self.app_config.runtime.prompts.get("safety", ""),
+            self._assistant_identity_prompt(),
+            owner_context_prompt,
+            self._owner_only_tools_prompt(selected_agent.name),
             selected_agent.system_prompt,
         ]
         system_prompt = "\n\n".join(part for part in prompt_parts if part)
-        conversation = self._get_active_conversation(message)
+        conversation = None if self._is_direct_message(message) else self._get_active_conversation(message)
         mention_only = self._is_mention_without_other_text(message)
         prefetched_channel_context = ""
-        if mention_only:
+        if mention_only or self._should_prefetch_channel_context(message):
             prefetched_channel_context = await self._prefetch_channel_history_for_message(message)
         memory_context = self._user_memory_context_for_message(message)
+        server_memory_context = self._server_memory_context_for_message(message)
         pending_burst_context = self._pending_burst_context(pending_messages, latest_message_id=message.id)
 
         messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
-        if conversation is not None:
+        if self._is_direct_message(message):
+            messages.extend(self._dm_conversation_context_for_message(message))
+        elif conversation is not None:
             messages.extend(conversation.messages)
 
-        user_message = {
-            "role": "user",
-            "content": (
-                "Respond to this Discord message as DiscoAssistant.\n"
-                f"Conversation mode: {'follow-up' if conversation is not None else 'new mention'}\n"
-                f"Mention-only message: {'yes' if mention_only else 'no'}\n"
-                f"Author username: {message.author}\n"
-                f"Author display name: {self._display_name_for_message_author(message)}\n"
-                f"Channel message: {message.content.strip()}\n"
-                "If this is a mention-only message, do not send a generic greeting. Use recent channel history to infer what the user is asking and answer that directly.\n"
-                "Always answer the latest user message, not an older one. If the latest message contains multiple questions, requests, or lines, address all of them in your reply.\n"
-                f"{pending_burst_context}"
-                f"{memory_context}"
-                f"{prefetched_channel_context}"
-                "Keep it short."
-            ),
-        }
-        messages.append(user_message)
+        if self._is_direct_message(message):
+            user_message = None
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Direct-message mode.\n"
+                        f"Owner user id: {self.app_config.settings.owner_user_id}\n"
+                        f"Author username: {message.author}\n"
+                        f"Author display name: {self._display_name_for_message_author(message)}\n"
+                        "Full DM chat history above is authoritative context. "
+                        "Latest user message is already included there. "
+                        "Use only user memory, not server memory. "
+                        "When using send_message, never guess recipient. "
+                        "Never say a message was sent unless tool result explicitly says ok true. "
+                        "If a tool call fails, keep working and retry when possible. "
+                        "Keep reply short."
+                        f"\n{memory_context}"
+                    ),
+                }
+            )
+        else:
+            user_message = {
+                "role": "user",
+                "content": (
+                    "Respond to this Discord message naturally as the logged-in account.\n"
+                    f"Conversation mode: {'follow-up' if conversation is not None else 'new mention'}\n"
+                    f"Mention-only message: {'yes' if mention_only else 'no'}\n"
+                    f"Owner user id: {self.app_config.settings.owner_user_id}\n"
+                    f"Author username: {message.author}\n"
+                    f"Author display name: {self._display_name_for_message_author(message)}\n"
+                    f"{self._mentioned_users_context(message)}"
+                    f"Channel message: {message.content.strip()}\n"
+                    "If this is a mention-only message, do not send a generic greeting. Use recent channel history to infer what the user is asking and answer that directly.\n"
+                    "When using send_message, never guess recipient. Use an explicit mentioned user id or the owner user id. If target is unclear, say so instead of sending.\n"
+                    "Never say a message was sent unless the tool result explicitly says ok true.\n"
+                    "If a tool call fails, keep working. Retry with corrected tool calls and do not answer user until tool work succeeds or is impossible after repeated retries.\n"
+                    "Always answer the latest user message, not an older one. If the latest message contains multiple questions, requests, or lines, address all of them in your reply.\n"
+                    f"{pending_burst_context}"
+                    f"{memory_context}"
+                    f"{server_memory_context}"
+                    f"{prefetched_channel_context}"
+                    "Keep it short."
+                ),
+            }
+            messages.append(user_message)
 
         extra_payload: dict[str, Any] = {
             "temperature": selected_agent.temperature,
@@ -231,14 +316,36 @@ class DiscoAssistant(discord.Client):
                 "message": message,
             },
         )
-        reply_text = self.extract_response_text(response)
+        reply_text = self.extract_response_text(response, messages=messages)
+        if reply_text == "I couldn't produce a normal reply, but I can try again.":
+            recovery_messages = [
+                *messages,
+                {
+                    "role": "user",
+                    "content": (
+                        "Answer the user's actual question directly now in one short reply. "
+                        "Do not narrate tool usage, do not ask what they want if the context already contains it, "
+                        "and use fetched history silently if it is relevant."
+                    ),
+                },
+            ]
+            recovery_response = await self.openrouter_chat(
+                model=selected_agent.model,
+                messages=recovery_messages,
+                extra_payload={
+                    "temperature": selected_agent.temperature,
+                    "max_tokens": selected_agent.max_output_tokens,
+                },
+            )
+            reply_text = self.extract_response_text(recovery_response, messages=recovery_messages)
         LOGGER.info("generate_reply_for_message done id=%s", message.id)
-        self._store_active_conversation(
-            message=message,
-            prior_conversation=conversation,
-            user_message=user_message,
-            assistant_reply=reply_text,
-        )
+        if not self._is_direct_message(message):
+            self._store_active_conversation(
+                message=message,
+                prior_conversation=conversation,
+                user_message=user_message,
+                assistant_reply=reply_text,
+            )
         return reply_text
 
     def _queue_reply_attempt(self, message: discord.Message) -> None:
@@ -325,18 +432,19 @@ class DiscoAssistant(discord.Client):
             async with message.channel.typing():
                 reply_text = await self.generate_reply_for_message(message, pending_messages)
             LOGGER.info("generation done key=%s message_id=%s reply=%r", key, message.id, reply_text)
-            await message.channel.send(reply_text, reference=message)
+            sent_message = await message.channel.send(reply_text, reference=message)
+            self._store_outgoing_dm_message(sent_message)
             LOGGER.info("reply sent key=%s message_id=%s", key, message.id)
         except asyncio.CancelledError:
             LOGGER.info("reply task cancelled key=%s", key)
             raise
-        except Exception:
+        except Exception as exc:
             pending = self._pending_replies.get(key)
             message = pending.message if pending is not None else None
             if message is not None:
                 LOGGER.exception("Failed to generate or send reply for message %s", message.id)
                 await message.channel.send(
-                    "I am DiscoAssistant, a Discord assistant. Something went wrong while I was thinking."
+                    self._safe_runtime_error_reply(exc)
                 )
             else:
                 LOGGER.exception("Failed to generate or send reply for conversation %s", key)
@@ -395,11 +503,32 @@ class DiscoAssistant(discord.Client):
         )
         max_calls = self.app_config.runtime.tool_policy.max_calls_per_turn
         tool_calls_used = 0
+        unresolved_tool_failure: dict[str, Any] | None = None
 
         while tool_calls_used < max_calls:
             assistant_message = response.get("choices", [{}])[0].get("message", {})
             tool_calls = assistant_message.get("tool_calls", [])
             if not tool_calls:
+                if unresolved_tool_failure is not None:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Previous tool call failed.\n"
+                                f"Tool: {unresolved_tool_failure['name']}\n"
+                                f"Error: {unresolved_tool_failure['error_message']}\n"
+                                "Do not answer user yet. Retry with corrected tool call. "
+                                "Only send final reply after tool succeeds."
+                            ),
+                        }
+                    )
+                    current_payload["tool_choice"] = "required"
+                    response = await self.openrouter_chat(
+                        model=model,
+                        messages=messages,
+                        extra_payload=current_payload,
+                    )
+                    continue
                 return response
 
             messages.append(
@@ -413,7 +542,29 @@ class DiscoAssistant(discord.Client):
             current_payload["tool_choice"] = "auto"
             for tool_call in tool_calls:
                 tool_calls_used += 1
-                tool_result = await self._execute_tool_call(tool_call, tool_context)
+                try:
+                    tool_result = await self._execute_tool_call(tool_call, tool_context)
+                except Exception as exc:
+                    LOGGER.exception(
+                        "Tool call failed name=%s id=%s",
+                        tool_call.get("function", {}).get("name", ""),
+                        tool_call.get("id", ""),
+                    )
+                    tool_result = {
+                        "ok": False,
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                    }
+                if tool_result.get("ok") is False:
+                    unresolved_tool_failure = {
+                        "name": tool_call["function"]["name"],
+                        "error_message": str(tool_result.get("error_message", "Tool failed.")),
+                    }
+                elif (
+                    unresolved_tool_failure is not None
+                    and unresolved_tool_failure["name"] == tool_call["function"]["name"]
+                ):
+                    unresolved_tool_failure = None
                 messages.append(
                     {
                         "role": "tool",
@@ -430,6 +581,20 @@ class DiscoAssistant(discord.Client):
                 messages=messages,
                 extra_payload=current_payload,
             )
+
+        if unresolved_tool_failure is not None:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                "Couldn't complete tool action after repeated retries: "
+                                f"{unresolved_tool_failure['error_message']}"
+                            )
+                        }
+                    }
+                ]
+            }
 
         current_payload["tool_choice"] = "none"
         return await self.openrouter_chat(
@@ -499,6 +664,14 @@ class DiscoAssistant(discord.Client):
             return await self._tool_append_user_memory(arguments, tool_context)
         if function_name == "edit_user_memory":
             return await self._tool_edit_user_memory(arguments, tool_context)
+        if function_name == "append_server_memory":
+            return await self._tool_append_server_memory(arguments, tool_context)
+        if function_name == "edit_server_memory":
+            return await self._tool_edit_server_memory(arguments, tool_context)
+        if function_name == "get_user_details":
+            return await self._tool_get_user_details(arguments, tool_context)
+        if function_name == "send_message":
+            return await self._tool_send_message(arguments, tool_context)
 
         raise RuntimeError(f"Unsupported tool call: {function_name}")
 
@@ -524,6 +697,7 @@ class DiscoAssistant(discord.Client):
                     "created_at": item.created_at.isoformat(),
                 }
             )
+            self._store_historical_dm_message(item)
 
         return {
             "channel_id": message.channel.id,
@@ -593,10 +767,219 @@ class DiscoAssistant(discord.Client):
             "status": "updated" if updated else "not_found",
         }
 
+    async def _tool_get_user_details(
+        self,
+        arguments: dict[str, Any],
+        tool_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        message: discord.Message = tool_context["message"]
+        requested_target_user_id = arguments.get("target_user_id")
+        target_user_id = int(requested_target_user_id) if requested_target_user_id is not None else message.author.id
+
+        member = self._member_from_message_context(message, target_user_id)
+        user = member or self._user_from_message_context(message, target_user_id)
+        if user is None:
+            user = await self.fetch_user(target_user_id)
+
+        profile: Any | None = None
+        profile_error: str | None = None
+        try:
+            if member is not None:
+                profile = await member.profile(
+                    with_mutual_guilds=True,
+                    with_mutual_friends_count=False,
+                    with_mutual_friends=False,
+                )
+            elif hasattr(user, "profile"):
+                profile = await user.profile(
+                    with_mutual_guilds=True,
+                    with_mutual_friends_count=False,
+                    with_mutual_friends=False,
+                )
+        except discord.HTTPException as exc:
+            profile_error = f"{type(exc).__name__}: {exc}"
+
+        effective_member = member if member is not None else (user if isinstance(user, discord.Member) else None)
+        display_name = (
+            self._display_name_for_message_author(message)
+            if target_user_id == message.author.id
+            else getattr(effective_member or user, "display_name", str(user))
+        )
+        bio = getattr(profile, "display_bio", None)
+        if bio is None:
+            bio = getattr(profile, "bio", None)
+        if bio is None:
+            bio = getattr(user, "bio", None)
+
+        metadata = getattr(profile, "metadata", None)
+        mutual_guilds = getattr(profile, "mutual_guilds", None)
+        avatar = getattr(user, "display_avatar", None)
+        banner = getattr(effective_member, "display_banner", None) or getattr(user, "banner", None)
+        accent_color = None
+        if metadata is not None and getattr(metadata, "accent_color", None) is not None:
+            accent_color = str(metadata.accent_color)
+        elif getattr(user, "accent_color", None) is not None:
+            accent_color = str(user.accent_color)
+
+        result: dict[str, Any] = {
+            "ok": True,
+            "target_user_id": user.id,
+            "username": str(user),
+            "name": getattr(user, "name", None),
+            "display_name": display_name,
+            "global_name": getattr(user, "global_name", None),
+            "mention": getattr(user, "mention", f"<@{user.id}>"),
+            "bot": getattr(user, "bot", False),
+            "system": getattr(user, "system", False),
+            "created_at": user.created_at.isoformat() if getattr(user, "created_at", None) else None,
+            "avatar_url": str(avatar.url) if avatar is not None else None,
+            "banner_url": str(banner.url) if banner is not None else None,
+            "accent_color": accent_color,
+            "bio": bio,
+            "legacy_username": getattr(profile, "legacy_username", None),
+            "profile_fetch_ok": profile_error is None,
+            "profile_fetch_error": profile_error,
+            "guild_member": {
+                "in_current_guild": effective_member is not None,
+                "nick": getattr(effective_member, "nick", None) if effective_member is not None else None,
+                "joined_at": (
+                    effective_member.joined_at.isoformat()
+                    if effective_member is not None and getattr(effective_member, "joined_at", None)
+                    else None
+                ),
+                "guild_bio": getattr(profile, "guild_bio", None),
+            },
+            "mutual_guilds": (
+                [
+                    {
+                        "id": guild.id,
+                        "name": getattr(getattr(guild, "guild", None), "name", None),
+                        "nick": getattr(guild, "nick", None),
+                    }
+                    for guild in mutual_guilds[:10]
+                ]
+                if mutual_guilds
+                else []
+            ),
+        }
+        if metadata is not None:
+            result["profile_metadata"] = {
+                "pronouns": getattr(metadata, "pronouns", None),
+                "banner_url": str(metadata.banner.url) if getattr(metadata, "banner", None) is not None else None,
+            }
+        return result
+
+    async def _tool_append_server_memory(
+        self,
+        arguments: dict[str, Any],
+        tool_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        message: discord.Message = tool_context["message"]
+        if message.guild is None:
+            raise ValueError("append_server_memory requires a guild/server channel.")
+
+        note = str(arguments.get("note", "")).strip()
+        if not note:
+            raise ValueError("append_server_memory.note is required.")
+
+        path = self.guild_memory_store.append_for_guild(
+            guild_id=message.guild.id,
+            guild_name=message.guild.name,
+            note=note,
+            author_display_name=self._display_name_for_message_author(message),
+            source_channel_id=message.channel.id,
+        )
+        return {
+            "ok": True,
+            "guild_id": message.guild.id,
+            "guild_name": message.guild.name,
+            "path": str(path),
+            "appended_note": note,
+        }
+
+    async def _tool_edit_server_memory(
+        self,
+        arguments: dict[str, Any],
+        tool_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        message: discord.Message = tool_context["message"]
+        if message.guild is None:
+            raise ValueError("edit_server_memory requires a guild/server channel.")
+
+        old_text = str(arguments.get("old_text", "")).strip()
+        new_text = str(arguments.get("new_text", "")).strip()
+        if not old_text or not new_text:
+            raise ValueError("edit_server_memory.old_text and new_text are required.")
+
+        path, updated = self.guild_memory_store.replace_for_guild(
+            guild_id=message.guild.id,
+            old_text=old_text,
+            new_text=new_text,
+        )
+        return {
+            "ok": updated,
+            "guild_id": message.guild.id,
+            "guild_name": message.guild.name,
+            "path": str(path),
+            "old_text": old_text,
+            "new_text": new_text,
+            "status": "updated" if updated else "not_found",
+        }
+
+    async def _tool_send_message(
+        self,
+        arguments: dict[str, Any],
+        tool_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        message: discord.Message = tool_context["message"]
+        author_id = message.author.id
+        owner_user_id = self.app_config.settings.owner_user_id
+        is_owner = author_id == owner_user_id
+
+        requested_target_user_id = arguments.get("target_user_id")
+        if requested_target_user_id is None:
+            raise ValueError("send_message.target_user_id is required. Do not guess recipient.")
+        target_user_id = int(requested_target_user_id)
+
+        content = str(arguments.get("message", "")).strip()
+        if not content:
+            raise ValueError("send_message.message is required.")
+
+        if not is_owner and target_user_id != owner_user_id:
+            raise ValueError("Only owner can send DMs to arbitrary users.")
+        if self.user is not None and target_user_id == self.user.id:
+            raise ValueError("Do not DM logged-in assistant account.")
+
+        user = self.get_user(target_user_id)
+        if user is None:
+            user = await self.fetch_user(target_user_id)
+
+        dm_channel = user.dm_channel
+        if dm_channel is None:
+            dm_channel = await user.create_dm()
+
+        sent_message = await dm_channel.send(content)
+        self._store_outgoing_dm_message(sent_message)
+        return {
+            "ok": True,
+            "from_user_id": author_id,
+            "target_user_id": target_user_id,
+            "dm_channel_id": dm_channel.id,
+            "message_id": sent_message.id,
+            "sent_message": content,
+        }
+
     def _user_memory_context_for_message(self, message: discord.Message) -> str:
         if not self.app_config.runtime.memory.enabled:
             return ""
         return self.user_memory_store.read_for_prompt(message.author.id)
+
+    def _server_memory_context_for_message(self, message: discord.Message) -> str:
+        if not self.app_config.runtime.memory.enabled:
+            return ""
+        if message.guild is None:
+            return ""
+        return self.guild_memory_store.read_for_prompt(message.guild.id)
 
     def _pending_burst_context(
         self,
@@ -616,6 +999,79 @@ class DiscoAssistant(discord.Client):
             lines.append(f"- {marker}: {content}")
         lines.append("")
         return "\n".join(lines)
+
+    def _store_incoming_dm_message(self, message: discord.Message) -> None:
+        if not self._is_direct_message(message):
+            return
+        self.dm_history_store.append_message(
+            user_id=message.author.id,
+            role="user",
+            content=message.content,
+            discord_message_id=message.id,
+            created_at=message.created_at.isoformat() if message.created_at else None,
+        )
+
+    def _store_historical_dm_message(self, message: discord.Message) -> None:
+        if not self._is_direct_message(message):
+            return
+        if self.user is None:
+            return
+
+        recipient = getattr(message.channel, "recipient", None)
+        if recipient is None:
+            return
+
+        if message.author.id == self.user.id:
+            user_id = recipient.id
+            role = "assistant"
+        else:
+            user_id = message.author.id
+            role = "user"
+
+        self.dm_history_store.append_message(
+            user_id=user_id,
+            role=role,
+            content=message.content,
+            discord_message_id=message.id,
+            created_at=message.created_at.isoformat() if message.created_at else None,
+        )
+
+    def _store_outgoing_dm_message(self, message: discord.Message) -> None:
+        if not self._is_direct_message(message):
+            return
+        recipient = getattr(message.channel, "recipient", None)
+        if recipient is None:
+            return
+        self.dm_history_store.append_message(
+            user_id=recipient.id,
+            role="assistant",
+            content=message.content,
+            discord_message_id=message.id,
+            created_at=message.created_at.isoformat() if message.created_at else None,
+        )
+
+    def _dm_conversation_context_for_message(self, message: discord.Message) -> list[dict[str, str]]:
+        return self.dm_history_store.read_conversation(user_id=message.author.id)
+
+    def _should_prefetch_channel_context(self, message: discord.Message) -> bool:
+        if self._is_direct_message(message):
+            return False
+
+        content = message.content.lower()
+        history_cues = (
+            "what were we talking",
+            "what were we discussing",
+            "what did i ask",
+            "answer the question",
+            "that question",
+            "earlier",
+            "before",
+            "pick up where",
+            "continue where",
+            "what was i saying",
+            "what were we on about",
+        )
+        return any(cue in content for cue in history_cues)
 
     def _tool_schemas_for_agent(self, allowed_tool_names: list[str]) -> list[dict[str, Any]]:
         if not self.app_config.runtime.tool_policy.allow_model_tool_calls:
@@ -725,6 +1181,122 @@ class DiscoAssistant(discord.Client):
                 }
             )
 
+        if "append_server_memory" in allowed:
+            schemas.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "append_server_memory",
+                        "description": (
+                            "Append shared durable notes about current Discord server to that server's markdown memory file. "
+                            "Use for small preferences, running jokes, local conventions, recurring relationships, "
+                            "or any server-level detail likely to help later, even if nobody explicitly asked you to remember it."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "note": {
+                                    "type": "string",
+                                    "description": (
+                                        "Short markdown-safe note to append to this server's memory file."
+                                    ),
+                                }
+                            },
+                            "required": ["note"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            )
+
+        if "edit_server_memory" in allowed:
+            schemas.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "edit_server_memory",
+                        "description": (
+                            "Update stale or changed facts inside current server's markdown memory file by replacing "
+                            "specific old text with new text."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "old_text": {
+                                    "type": "string",
+                                    "description": "Exact existing text snippet from server memory that should be replaced.",
+                                },
+                                "new_text": {
+                                    "type": "string",
+                                    "description": "New replacement text that should overwrite old_text.",
+                                },
+                            },
+                            "required": ["old_text", "new_text"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            )
+
+        if "get_user_details" in allowed:
+            schemas.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_user_details",
+                        "description": (
+                            "Fetch profile details for current chatter by default, or for an explicit Discord user id. "
+                            "Use this when user asks who someone is, wants their user id, bio, profile details, "
+                            "or more context about the current chatter."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "target_user_id": {
+                                    "type": "integer",
+                                    "description": (
+                                        "Optional Discord user id to inspect. Omit to inspect current message author."
+                                    ),
+                                }
+                            },
+                            "required": [],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            )
+
+        if "send_message" in allowed:
+            schemas.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "send_message",
+                        "description": (
+                            "Send direct message to Discord user. Non-owner users may only message owner. "
+                            "Owner may message any user. Never use this unless target user id is explicit."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "target_user_id": {
+                                    "type": "integer",
+                                    "description": (
+                                        "Discord user id to DM. Required. Use owner user id when user wants to message owner."
+                                    ),
+                                },
+                                "message": {
+                                    "type": "string",
+                                    "description": "Direct message content to send.",
+                                },
+                            },
+                            "required": ["target_user_id", "message"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            )
+
         return schemas
 
     def _tool_choice_for_message(self, message: discord.Message) -> str | dict[str, Any]:
@@ -738,6 +1310,8 @@ class DiscoAssistant(discord.Client):
         return "auto"
 
     def _has_active_conversation(self, message: discord.Message) -> bool:
+        if self._is_direct_message(message):
+            return False
         return self._get_active_conversation(message) is not None
 
     def _has_pending_reply(self, message: discord.Message) -> bool:
@@ -746,6 +1320,8 @@ class DiscoAssistant(discord.Client):
         return key in self._pending_replies or (task is not None and not task.done())
 
     def _get_active_conversation(self, message: discord.Message) -> ActiveConversation | None:
+        if self._is_direct_message(message):
+            return None
         key = self._conversation_key(message)
         conversation = self._active_conversations.get(key)
         if conversation is None:
@@ -828,6 +1404,10 @@ class DiscoAssistant(discord.Client):
     def _conversation_key(message: discord.Message) -> tuple[int, int]:
         return (message.channel.id, message.author.id)
 
+    @staticmethod
+    def _is_direct_message(message: discord.Message) -> bool:
+        return message.guild is None
+
     def _is_mention_without_other_text(self, message: discord.Message) -> bool:
         if self.user is None:
             return False
@@ -849,11 +1429,21 @@ class DiscoAssistant(discord.Client):
         return self.app_config.runtime.agents["public"]
 
     @staticmethod
-    def extract_response_text(response: dict[str, Any]) -> str:
+    def extract_response_text(
+        response: dict[str, Any],
+        *,
+        messages: list[dict[str, Any]] | None = None,
+    ) -> str:
         choices = response.get("choices", [])
         if not choices:
-            raise RuntimeError("OpenRouter response did not include any choices.")
+            LOGGER.warning("OpenRouter response had no choices. Falling back to default reply.")
+            return DiscoAssistant._fallback_response_text(
+                messages,
+                default="I couldn't produce a reply just now.",
+            )
 
+        choice = choices[0]
+        finish_reason = choice.get("finish_reason")
         message = choices[0].get("message", {})
         content = message.get("content", "")
 
@@ -872,12 +1462,203 @@ class DiscoAssistant(discord.Client):
             if text_parts:
                 return "\n".join(text_parts)
 
-        raise RuntimeError("OpenRouter response did not include usable text content.")
+        LOGGER.warning(
+            "OpenRouter response had no usable text content. finish_reason=%r content_type=%s tool_calls=%s message_keys=%s",
+            finish_reason,
+            type(content).__name__,
+            bool(message.get("tool_calls")),
+            sorted(message.keys()),
+        )
+        return DiscoAssistant._fallback_response_text(messages)
 
     @staticmethod
     def _display_name_for_message_author(message: discord.Message) -> str:
         author = message.author
         return getattr(author, "display_name", str(author))
+
+    def _mentioned_users_context(self, message: discord.Message) -> str:
+        if not message.mentions:
+            return "Mentioned users: none\n"
+
+        lines = ["Mentioned users:"]
+        for user in message.mentions:
+            lines.append(
+                f"- username: {user} | display_name: {getattr(user, 'display_name', str(user))} | user_id: {user.id}"
+            )
+        return "\n".join(lines) + "\n"
+
+    async def _owner_context_prompt(self, message: discord.Message) -> str:
+        if self._owner_context_prompt_cache is not None:
+            return self._owner_context_prompt_cache
+
+        owner_user_id = self.app_config.settings.owner_user_id
+        owner_user = self._user_from_message_context(message, owner_user_id)
+        if owner_user is None:
+            owner_user = self.get_user(owner_user_id)
+        if owner_user is None:
+            try:
+                owner_user = await self.fetch_user(owner_user_id)
+            except discord.HTTPException as exc:
+                LOGGER.warning("Failed to fetch owner user details for prompt: %s", exc)
+                prompt = f"Owner profile:\n- owner_user_id: {owner_user_id}\n"
+                self._owner_context_prompt_cache = prompt
+                return prompt
+
+        owner_bio = getattr(owner_user, "bio", None)
+        if owner_bio is None and hasattr(owner_user, "profile"):
+            try:
+                owner_profile = await owner_user.profile(
+                    with_mutual_guilds=False,
+                    with_mutual_friends_count=False,
+                    with_mutual_friends=False,
+                )
+                owner_bio = getattr(owner_profile, "display_bio", None) or getattr(owner_profile, "bio", None)
+            except discord.HTTPException as exc:
+                LOGGER.info("Owner profile fetch unavailable for prompt: %s", exc)
+
+        prompt_lines = [
+            "Owner profile:",
+            f"- owner_user_id: {owner_user_id}",
+            f"- owner_username: {owner_user}",
+            f"- owner_name: {getattr(owner_user, 'name', str(owner_user))}",
+            f"- owner_display_name: {getattr(owner_user, 'display_name', str(owner_user))}",
+            f"- owner_global_name: {getattr(owner_user, 'global_name', None) or '(none)'}",
+            f"- owner_mention: {getattr(owner_user, 'mention', f'<@{owner_user_id}>')}",
+            f"- owner_bio: {owner_bio or '(none)'}",
+            (
+                f"- owner_created_at: {owner_user.created_at.isoformat()}"
+                if getattr(owner_user, "created_at", None)
+                else "- owner_created_at: (unknown)"
+            ),
+        ]
+        self._owner_context_prompt_cache = "\n".join(prompt_lines) + "\n"
+        return self._owner_context_prompt_cache
+
+    def _owner_only_tools_prompt(self, active_agent_name: str) -> str:
+        owner_agent = self.app_config.runtime.agents.get("owner")
+        public_agent = self.app_config.runtime.agents.get("public")
+        if owner_agent is None or public_agent is None:
+            return ""
+
+        owner_only_tools = [tool for tool in owner_agent.tools if tool not in public_agent.tools]
+        if not owner_only_tools:
+            return ""
+
+        lines = [
+            "Owner-only capabilities:",
+            f"- real owner agent name: {owner_agent.name}",
+            f"- current active agent name: {active_agent_name}",
+            f"- owner-only tool calls: {', '.join(owner_only_tools)}",
+            "- If current user is not owner, these tool calls are not available to you.",
+            "- If a non-owner asks for an owner-only action, explain limitation briefly.",
+            "- Only if escalation is genuinely needed, ping real owner in channel using owner_mention.",
+            "- Never claim you used an owner-only tool unless tool result explicitly proves it.",
+        ]
+        return "\n".join(lines) + "\n"
+
+    def _assistant_identity_prompt(self) -> str:
+        owner_user_id = self.app_config.settings.owner_user_id
+        if self.user is None:
+            return (
+                "Assistant identity:\n"
+                "- platform: Discord\n"
+                f"- owner_user_id: {owner_user_id}\n"
+                "- You are the logged-in user account for this assistant.\n"
+            )
+
+        return (
+            "Assistant identity:\n"
+            f"- account_username: {self.user}\n"
+            f"- account_user_id: {self.user.id}\n"
+            f"- account_mention: {self.user.mention}\n"
+            f"- owner_user_id: {owner_user_id}\n"
+            "- You are this Discord account. Do not confuse yourself with message author or owner.\n"
+            "- If user asks who you are, use this identity.\n"
+        )
+
+    @staticmethod
+    def _fallback_response_text(
+        messages: list[dict[str, Any]] | None,
+        *,
+        default: str = "I couldn't produce a normal reply, but I can try again.",
+    ) -> str:
+        if messages:
+            for item in reversed(messages):
+                if item.get("role") != "tool":
+                    continue
+                try:
+                    payload = json.loads(item.get("content", "{}"))
+                except json.JSONDecodeError:
+                    continue
+
+                if payload.get("ok") is False:
+                    error_message = str(payload.get("error_message", "")).strip()
+                    if error_message:
+                        return f"Couldn't do that: {error_message}"
+                    return "Couldn't do that."
+
+                if item.get("name") == "send_message" and payload.get("ok") is True:
+                    target_user_id = payload.get("target_user_id")
+                    return f"Message sent to user `{target_user_id}`."
+
+        return default
+
+    @staticmethod
+    def _safe_runtime_error_reply(exc: Exception) -> str:
+        if isinstance(exc, aiohttp.ClientResponseError) and exc.status == 429:
+            if "openrouter.ai" in str(exc.request_info.real_url):
+                return "Model rate-limited me. Try again in a few seconds."
+            return "Rate-limited by upstream service. Try again in a few seconds."
+        message = str(exc).strip()
+        if message:
+            return f"I hit an internal error: {type(exc).__name__}: {message}"
+        return f"I hit an internal error: {type(exc).__name__}."
+
+    def _user_from_message_context(
+        self,
+        message: discord.Message,
+        user_id: int,
+    ) -> discord.abc.User | None:
+        if message.author.id == user_id:
+            return message.author
+
+        for user in self._iter_mentions(message):
+            if user.id == user_id:
+                return user
+
+        member = self._member_from_message_context(message, user_id)
+        if member is not None:
+            return member
+
+        return self.get_user(user_id)
+
+    def _member_from_message_context(
+        self,
+        message: discord.Message,
+        user_id: int,
+    ) -> discord.Member | None:
+        if isinstance(message.author, discord.Member) and message.author.id == user_id:
+            return message.author
+
+        guild = getattr(message, "guild", None)
+        if guild is None:
+            return None
+        return guild.get_member(user_id)
+
+    @staticmethod
+    def _retry_after_seconds(headers: Any) -> float | None:
+        if not headers:
+            return None
+
+        value = headers.get("Retry-After")
+        if value is None:
+            return None
+
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            return None
+        return max(0.0, seconds)
 
 
 bot: DiscoAssistant | None = None
