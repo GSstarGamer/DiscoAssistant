@@ -40,6 +40,21 @@ class DiscordConfig(BaseModel):
     max_history_messages: int = 20
     conversation_window_seconds: int = 10
     reply_debounce_seconds: float = 2.5
+    presence: "DiscordPresenceConfig" = Field(default_factory=lambda: DiscordPresenceConfig())
+
+
+class DiscordPresenceConfig(BaseModel):
+    enabled: bool = False
+    type: str = "streaming"
+    name: str = "Live on Twitch"
+    url: str | None = None
+    state: str | None = None
+    details: str | None = None
+    status: str = "online"
+    token_usage_enabled: bool = False
+    token_usage_name_template: str = "{total_tokens:,} tokens used"
+    token_usage_state_template: str | None = None
+    token_usage_details_template: str | None = None
 
 
 class MemoryConfig(BaseModel):

@@ -3,7 +3,20 @@
     "respond_to_bots": false,
     "max_history_messages": 20,
     "conversation_window_seconds": 10,
-    "reply_debounce_seconds": 2.5
+    "reply_debounce_seconds": 2.5,
+    "presence": {
+      "enabled": true,
+      "type": "streaming",
+      "name": "Helping YOU out",
+      "url": "https://rionnag.net/",
+      "state": "Used 0 tokens this session",
+      "details": null,
+      "status": "online",
+      "token_usage_enabled": true,
+      "token_usage_name_template": "Helping YOU out",
+      "token_usage_state_template": "Used {total_tokens:,} tokens this session",
+      "token_usage_details_template": null
+    }
   },
   "memory": {
     "enabled": true,

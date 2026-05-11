@@ -48,6 +48,9 @@ class DiscoAssistant(discord.Client):
         self._pending_replies: dict[tuple[int, int], PendingReply] = {}
         self._reply_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
         self._reply_generation_in_progress: set[tuple[int, int]] = set()
+        self._session_total_tokens_used = 0
+        self._presence_update_task: asyncio.Task[None] | None = None
+        self._presence_refresh_requested = False
         self.user_memory_store = UserMemoryStore(
             base_dir=BASE_DIR / self.app_config.runtime.memory.user_directory,
             max_chars_in_prompt=self.app_config.runtime.memory.max_user_chars_in_prompt,
@@ -78,6 +81,8 @@ class DiscoAssistant(discord.Client):
         )
 
     async def on_ready(self) -> None:
+        await self._apply_configured_presence()
+
         if self._startup_announced:
             LOGGER.info("Reconnected as %s (%s)", self.user, self.user.id if self.user else "unknown")
             return
@@ -91,6 +96,153 @@ class DiscoAssistant(discord.Client):
             self.app_config.runtime.openrouter.default_model,
         )
         print(f"DiscoAssistant is ready as {self.user}")
+
+    async def _apply_configured_presence(self) -> None:
+        presence_config = self.app_config.runtime.discord.presence
+        if not presence_config.enabled:
+            return
+
+        activity = self._build_configured_activity()
+        status = self._configured_status()
+        try:
+            await self.change_presence(status=status, activity=activity)
+        except Exception:
+            LOGGER.exception(
+                "Failed to apply configured Discord presence type=%s name=%r",
+                presence_config.type,
+                presence_config.name,
+            )
+            return
+
+        LOGGER.info(
+            "Applied configured presence type=%s status=%s name=%r",
+            presence_config.type,
+            presence_config.status,
+            self._configured_presence_name(),
+        )
+
+    def _build_configured_activity(self) -> discord.BaseActivity | None:
+        presence_config = self.app_config.runtime.discord.presence
+        activity_type = presence_config.type.lower().strip()
+
+        if activity_type == "streaming":
+            if not presence_config.url:
+                LOGGER.warning("Discord streaming presence enabled but no Twitch URL configured.")
+                return None
+            return discord.Activity(
+                type=discord.ActivityType.streaming,
+                name=self._configured_presence_name(),
+                url=presence_config.url,
+                details=self._configured_presence_details(),
+                state=self._configured_presence_state(),
+            )
+
+        LOGGER.warning("Unsupported Discord presence type %r. Skipping activity.", presence_config.type)
+        return None
+
+    def _configured_status(self) -> discord.Status:
+        status_value = self.app_config.runtime.discord.presence.status.lower().strip()
+        status_map = {
+            "online": discord.Status.online,
+            "idle": discord.Status.idle,
+            "dnd": discord.Status.dnd,
+            "do_not_disturb": discord.Status.dnd,
+            "invisible": discord.Status.invisible,
+            "offline": discord.Status.invisible,
+        }
+        if status_value not in status_map:
+            LOGGER.warning("Unsupported Discord status %r. Falling back to online.", status_value)
+        return status_map.get(status_value, discord.Status.online)
+
+    def _configured_presence_name(self) -> str:
+        presence_config = self.app_config.runtime.discord.presence
+        if not presence_config.token_usage_enabled:
+            return presence_config.name
+
+        try:
+            return presence_config.token_usage_name_template.format(
+                total_tokens=self._session_total_tokens_used,
+            )
+        except Exception:
+            LOGGER.exception(
+                "Invalid token usage presence template %r. Falling back to default name.",
+                presence_config.token_usage_name_template,
+            )
+            return presence_config.name
+
+    def _configured_presence_state(self) -> str | None:
+        presence_config = self.app_config.runtime.discord.presence
+        template = (
+            presence_config.token_usage_state_template
+            if presence_config.token_usage_enabled and presence_config.token_usage_state_template
+            else None
+        )
+        if template is None:
+            return presence_config.state
+
+        try:
+            return template.format(total_tokens=self._session_total_tokens_used)
+        except Exception:
+            LOGGER.exception(
+                "Invalid token usage state template %r. Falling back to default state.",
+                template,
+            )
+            return presence_config.state
+
+    def _configured_presence_details(self) -> str | None:
+        presence_config = self.app_config.runtime.discord.presence
+        template = (
+            presence_config.token_usage_details_template
+            if presence_config.token_usage_enabled and presence_config.token_usage_details_template
+            else None
+        )
+        if template is None:
+            return presence_config.details
+
+        try:
+            return template.format(total_tokens=self._session_total_tokens_used)
+        except Exception:
+            LOGGER.exception(
+                "Invalid token usage details template %r. Falling back to default details.",
+                template,
+            )
+            return presence_config.details
+
+    def _record_token_usage(self, response_payload: dict[str, Any]) -> None:
+        usage = response_payload.get("usage")
+        if not isinstance(usage, dict):
+            return
+
+        total_tokens = usage.get("total_tokens")
+        if not isinstance(total_tokens, int) or total_tokens <= 0:
+            return
+
+        self._session_total_tokens_used += total_tokens
+        self._schedule_presence_refresh()
+
+    def _schedule_presence_refresh(self) -> None:
+        presence_config = self.app_config.runtime.discord.presence
+        if not (presence_config.enabled and presence_config.token_usage_enabled):
+            return
+
+        self._presence_refresh_requested = True
+        if self._presence_update_task is not None and not self._presence_update_task.done():
+            return
+        self._presence_update_task = asyncio.create_task(self._flush_presence_refresh())
+
+    async def _flush_presence_refresh(self) -> None:
+        try:
+            await asyncio.sleep(5)
+            if not self._presence_refresh_requested:
+                return
+            self._presence_refresh_requested = False
+            await self._apply_configured_presence()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception("Failed while refreshing token-usage presence.")
+        finally:
+            self._presence_update_task = None
 
     async def on_message(self, message: discord.Message) -> None:
         self._append_passive_channel_context(message)
@@ -126,6 +278,8 @@ class DiscoAssistant(discord.Client):
         for task in self._reply_tasks.values():
             if not task.done():
                 task.cancel()
+        if self._presence_update_task is not None and not self._presence_update_task.done():
+            self._presence_update_task.cancel()
         if self.http_session is not None and not self.http_session.closed:
             await self.http_session.close()
         await super().close()
@@ -156,7 +310,9 @@ class DiscoAssistant(discord.Client):
                     json=payload,
                 ) as response:
                     response.raise_for_status()
-                    return await response.json()
+                    response_payload = await response.json()
+                    self._record_token_usage(response_payload)
+                    return response_payload
             except aiohttp.ClientResponseError as exc:
                 last_error = exc
                 should_retry = exc.status in {429, 500, 502, 503, 504} and attempt < max_attempts
