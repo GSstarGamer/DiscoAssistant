@@ -561,8 +561,8 @@ class DiscoAssistant(discord.Client):
             "Pending passive server-memory flush confirmation is active.\n"
             f"- guild_id: {confirmation.guild_id}\n"
             f"- queued_message_count: {confirmation.pending_message_count}\n"
-            "- If the owner confirms, call flush_passive_server_memory.\n"
-            "- If the owner declines, call cancel_passive_server_memory_flush.\n"
+            "- If the owner confirms, call passive_flush(action='confirm').\n"
+            "- If the owner declines, call passive_flush(action='cancel').\n"
             "- Do not preview again while this confirmation is active.\n"
         )
 
@@ -1209,7 +1209,7 @@ class DiscoAssistant(discord.Client):
                         "Full DM chat history above is authoritative context. "
                         "Latest user message is already included there. "
                         "Use only user memory, not server memory. "
-                        "When using send_message, never guess recipient. "
+                        "When using send_dm, never guess recipient. "
                         "Never say a message was sent unless tool result explicitly says ok true. "
                         "If a tool call fails, keep working and retry when possible. "
                         "Keep reply short."
@@ -1233,7 +1233,7 @@ class DiscoAssistant(discord.Client):
                     f"{reply_reference_context}"
                     f"Channel message: {self._message_text_for_context(message) or '(no text)'}\n"
                     "If this is a mention-only message, do not send a generic greeting. Use recent channel history to infer what the user is asking and answer that directly.\n"
-                    "When using send_message, never guess recipient. Use an explicit mentioned user id or the owner user id. If target is unclear, say so instead of sending.\n"
+                    "When using send_dm, never guess recipient. Use an explicit mentioned user id or the owner user id. If target is unclear, say so instead of sending.\n"
                     "Never say a message was sent unless the tool result explicitly says ok true.\n"
                     "If a tool call fails, keep working. Retry with corrected tool calls and do not answer user until tool work succeeds or is impossible after repeated retries.\n"
                     "Always answer the latest user message, not an older one. If the latest message contains multiple questions, requests, or lines, address all of them in your reply.\n"
@@ -2013,28 +2013,20 @@ class DiscoAssistant(discord.Client):
             raw_arguments,
         )
 
-        if function_name == "get_channel_history":
-            result = await self._tool_get_channel_history(arguments, tool_context)
-        elif function_name == "append_user_memory":
-            result = await self._tool_append_user_memory(arguments, tool_context)
-        elif function_name == "edit_user_memory":
-            result = await self._tool_edit_user_memory(arguments, tool_context)
-        elif function_name == "get_user_memory":
-            result = await self._tool_get_user_memory(arguments, tool_context)
-        elif function_name == "append_server_memory":
-            result = await self._tool_append_server_memory(arguments, tool_context)
-        elif function_name == "edit_server_memory":
-            result = await self._tool_edit_server_memory(arguments, tool_context)
-        elif function_name == "preview_passive_server_memory_flush":
-            result = await self._tool_preview_passive_server_memory_flush(arguments, tool_context)
-        elif function_name == "flush_passive_server_memory":
-            result = await self._tool_flush_passive_server_memory(arguments, tool_context)
-        elif function_name == "cancel_passive_server_memory_flush":
-            result = await self._tool_cancel_passive_server_memory_flush(arguments, tool_context)
-        elif function_name == "get_user_details":
-            result = await self._tool_get_user_details(arguments, tool_context)
-        elif function_name == "send_message":
-            result = await self._tool_send_message(arguments, tool_context)
+        if function_name == "read_channel":
+            result = await self._tool_read_channel(arguments, tool_context)
+        elif function_name == "lookup_user":
+            result = await self._tool_lookup_user(arguments, tool_context)
+        elif function_name == "remember":
+            result = await self._tool_remember(arguments, tool_context)
+        elif function_name == "edit_memory":
+            result = await self._tool_edit_memory(arguments, tool_context)
+        elif function_name == "read_user_memory":
+            result = await self._tool_read_user_memory(arguments, tool_context)
+        elif function_name == "passive_flush":
+            result = await self._tool_passive_flush(arguments, tool_context)
+        elif function_name == "send_dm":
+            result = await self._tool_send_dm(arguments, tool_context)
         else:
             raise RuntimeError(f"Unsupported tool call: {function_name}")
 
@@ -2046,7 +2038,7 @@ class DiscoAssistant(discord.Client):
         )
         return result
 
-    async def _tool_get_channel_history(
+    async def _tool_read_channel(
         self,
         arguments: dict[str, Any],
         tool_context: dict[str, Any],
@@ -2054,7 +2046,7 @@ class DiscoAssistant(discord.Client):
         message: discord.Message = tool_context["message"]
         limit = int(arguments.get("limit", self.app_config.runtime.discord.max_history_messages))
         limit = max(1, min(limit, 100))
-        requested_channel_id = arguments.get("target_channel_id")
+        requested_channel_id = arguments.get("channel_id")
         target_channel = message.channel
         before_message_id = arguments.get("before_message_id", message.id)
         if requested_channel_id is not None:
@@ -2065,7 +2057,7 @@ class DiscoAssistant(discord.Client):
                 target_channel = fetched_channel
             before_message_id = arguments.get("before_message_id")
         LOGGER.info(
-            "Fetching channel history requester=%s target_channel_id=%s limit=%s before_message_id=%s",
+            "read_channel requester=%s target_channel_id=%s limit=%s before_message_id=%s",
             message.author.id,
             getattr(target_channel, "id", None),
             limit,
@@ -2073,7 +2065,7 @@ class DiscoAssistant(discord.Client):
         )
 
         if not hasattr(target_channel, "history"):
-            raise ValueError("get_channel_history target channel does not support message history.")
+            raise ValueError("read_channel target channel does not support message history.")
 
         before_message = discord.Object(id=int(before_message_id)) if before_message_id is not None else None
         history = []
@@ -2081,6 +2073,7 @@ class DiscoAssistant(discord.Client):
             history.append(
                 {
                     "message_id": item.id,
+                    "author_user_id": item.author.id,
                     "author_username": str(item.author),
                     "author_display_name": self._display_name_for_message_author(item),
                     "content": self._message_text_for_context(item),
@@ -2090,13 +2083,14 @@ class DiscoAssistant(discord.Client):
             self._store_historical_dm_message(item)
 
         return {
+            "ok": True,
             "channel_id": target_channel.id,
             "fetched_count": len(history),
             "messages": history,
         }
 
     async def _prefetch_channel_history_for_message(self, message: discord.Message) -> str:
-        history_payload = await self._tool_get_channel_history({}, {"message": message})
+        history_payload = await self._tool_read_channel({}, {"message": message})
         history_messages = history_payload.get("messages", [])
         if not history_messages:
             return "Recent channel context:\n(none)\n"
@@ -2109,69 +2103,132 @@ class DiscoAssistant(discord.Client):
         lines.append("")
         return "\n".join(lines)
 
-    async def _tool_append_user_memory(
+    async def _tool_remember(
         self,
         arguments: dict[str, Any],
         tool_context: dict[str, Any],
     ) -> dict[str, Any]:
         message: discord.Message = tool_context["message"]
-        self._require_owner(message, "append_user_memory")
+        self._require_owner(message, "remember")
+        scope = str(arguments.get("scope", "")).strip().lower()
+        if scope not in {"user", "server"}:
+            raise ValueError("remember.scope must be 'user' or 'server'.")
         note = str(arguments.get("note", "")).strip()
         if not note:
-            raise ValueError("append_user_memory.note is required.")
+            raise ValueError("remember.note is required.")
 
-        path = self.user_memory_store.append_for_user(
-            user_id=message.author.id,
+        if scope == "user":
+            path = self.user_memory_store.append_for_user(
+                user_id=message.author.id,
+                note=note,
+                author_display_name=self._display_name_for_message_author(message),
+            )
+            return {
+                "ok": True,
+                "scope": "user",
+                "user_id": message.author.id,
+                "path": str(path),
+                "appended_note": note,
+            }
+
+        if message.guild is None:
+            raise ValueError("remember(scope='server') requires a guild/server channel.")
+        path = self.guild_memory_store.append_for_guild(
+            guild_id=message.guild.id,
+            guild_name=message.guild.name,
             note=note,
-            author_display_name=self._display_name_for_message_author(message),
-            source_channel_id=message.channel.id,
+            owner_priority=True,
+        )
+        await self._notify_owner_of_guild_memory_update(
+            guild_id=message.guild.id,
+            guild_name=message.guild.name,
+            summary=(
+                "Owner-approved server memory note:\n"
+                f"- channel_id: {message.channel.id}\n"
+                f"- note: {note}"
+            ),
         )
         return {
             "ok": True,
-            "user_id": message.author.id,
+            "scope": "server",
+            "guild_id": message.guild.id,
+            "guild_name": message.guild.name,
             "path": str(path),
             "appended_note": note,
         }
 
-    async def _tool_edit_user_memory(
+    async def _tool_edit_memory(
         self,
         arguments: dict[str, Any],
         tool_context: dict[str, Any],
     ) -> dict[str, Any]:
         message: discord.Message = tool_context["message"]
-        self._require_owner(message, "edit_user_memory")
-        old_text = str(arguments.get("old_text", "")).strip()
-        new_text = str(arguments.get("new_text", "")).strip()
-        if not old_text or not new_text:
-            raise ValueError("edit_user_memory.old_text and new_text are required.")
+        self._require_owner(message, "edit_memory")
+        scope = str(arguments.get("scope", "")).strip().lower()
+        if scope not in {"user", "server"}:
+            raise ValueError("edit_memory.scope must be 'user' or 'server'.")
+        find = str(arguments.get("find", "")).strip()
+        replace_with = str(arguments.get("replace", "")).strip()
+        if not find:
+            raise ValueError("edit_memory.find is required.")
 
-        path, updated = self.user_memory_store.replace_for_user(
-            user_id=message.author.id,
-            old_text=old_text,
-            new_text=new_text,
+        if scope == "user":
+            path, updated = self.user_memory_store.replace_for_user(
+                user_id=message.author.id,
+                old_text=find,
+                new_text=replace_with,
+            )
+            return {
+                "ok": updated,
+                "scope": "user",
+                "user_id": message.author.id,
+                "path": str(path),
+                "find": find,
+                "replace": replace_with,
+                "status": "updated" if updated else "not_found",
+            }
+
+        if message.guild is None:
+            raise ValueError("edit_memory(scope='server') requires a guild/server channel.")
+        path, updated = self.guild_memory_store.replace_for_guild(
+            guild_id=message.guild.id,
+            old_text=find,
+            new_text=replace_with,
         )
+        if updated:
+            await self._notify_owner_of_guild_memory_update(
+                guild_id=message.guild.id,
+                guild_name=message.guild.name,
+                summary=(
+                    "Owner-approved server memory edit:\n"
+                    f"- find: {find}\n"
+                    f"- replace: {replace_with}"
+                ),
+            )
         return {
             "ok": updated,
-            "user_id": message.author.id,
+            "scope": "server",
+            "guild_id": message.guild.id,
+            "guild_name": message.guild.name,
             "path": str(path),
-            "old_text": old_text,
-            "new_text": new_text,
+            "find": find,
+            "replace": replace_with,
             "status": "updated" if updated else "not_found",
         }
 
-    async def _tool_get_user_memory(
+    async def _tool_read_user_memory(
         self,
         arguments: dict[str, Any],
         tool_context: dict[str, Any],
     ) -> dict[str, Any]:
         message: discord.Message = tool_context["message"]
-        self._require_owner(message, "get_user_memory")
+        self._require_owner(message, "read_user_memory")
 
         requested_target_user_id = arguments.get("target_user_id")
         if requested_target_user_id is None:
-            raise ValueError("get_user_memory.target_user_id is required.")
+            raise ValueError("read_user_memory.target_user_id is required.")
         target_user_id = self._resolve_target_user_id(message, requested_target_user_id)
-        LOGGER.info("Reading user memory requester=%s target_user_id=%s", message.author.id, target_user_id)
+        LOGGER.info("read_user_memory requester=%s target_user_id=%s", message.author.id, target_user_id)
 
         path = self.user_memory_store.path_for_user(target_user_id)
         content = self.user_memory_store.read_for_user(target_user_id)
@@ -2183,13 +2240,13 @@ class DiscoAssistant(discord.Client):
             "memory": content or "",
         }
 
-    async def _tool_get_user_details(
+    async def _tool_lookup_user(
         self,
         arguments: dict[str, Any],
         tool_context: dict[str, Any],
     ) -> dict[str, Any]:
         message: discord.Message = tool_context["message"]
-        requested_target_user_id = arguments.get("target_user_id")
+        requested_target_user_id = arguments.get("user_id")
         target_user_id = (
             self._resolve_target_user_id(message, requested_target_user_id)
             if requested_target_user_id is not None
@@ -2289,183 +2346,70 @@ class DiscoAssistant(discord.Client):
             }
         return result
 
-    async def _tool_append_server_memory(
+    async def _tool_passive_flush(
         self,
         arguments: dict[str, Any],
         tool_context: dict[str, Any],
     ) -> dict[str, Any]:
         message: discord.Message = tool_context["message"]
-        self._require_owner(message, "append_server_memory")
-        if message.guild is None:
-            raise ValueError("append_server_memory requires a guild/server channel.")
+        self._require_owner(message, "passive_flush")
+        action = str(arguments.get("action", "")).strip().lower()
+        if action not in {"preview", "confirm", "cancel"}:
+            raise ValueError("passive_flush.action must be 'preview', 'confirm', or 'cancel'.")
 
-        note = str(arguments.get("note", "")).strip()
-        if not note:
-            raise ValueError("append_server_memory.note is required.")
-        LOGGER.info(
-            "Appending server memory requester=%s guild_id=%s channel_id=%s note_chars=%s",
-            message.author.id,
-            message.guild.id,
-            message.channel.id,
-            len(note),
-        )
+        if message.guild is None and arguments.get("guild_id") is None:
+            raise ValueError("passive_flush requires a guild/server channel or explicit guild_id.")
+        guild_id = int(arguments["guild_id"]) if arguments.get("guild_id") is not None else message.guild.id
+        guild_name = message.guild.name if message.guild is not None else None
 
-        path = self.guild_memory_store.append_for_guild(
-            guild_id=message.guild.id,
-            guild_name=message.guild.name,
-            note=note,
-            author_display_name=self._display_name_for_message_author(message),
-            source_channel_id=message.channel.id,
-            owner_priority=True,
-        )
-        await self._notify_owner_of_guild_memory_update(
-            guild_id=message.guild.id,
-            guild_name=message.guild.name,
-            summary=(
-                "Owner-approved guild memory append:\n"
-                f"- channel_id: {message.channel.id}\n"
-                f"- author: {self._display_name_for_message_author(message)}\n"
-                f"- note: {note}"
-            ),
-        )
-        return {
-            "ok": True,
-            "guild_id": message.guild.id,
-            "guild_name": message.guild.name,
-            "path": str(path),
-            "appended_note": note,
-        }
-
-    async def _tool_edit_server_memory(
-        self,
-        arguments: dict[str, Any],
-        tool_context: dict[str, Any],
-    ) -> dict[str, Any]:
-        message: discord.Message = tool_context["message"]
-        self._require_owner(message, "edit_server_memory")
-        if message.guild is None:
-            raise ValueError("edit_server_memory requires a guild/server channel.")
-
-        old_text = str(arguments.get("old_text", "")).strip()
-        new_text = str(arguments.get("new_text", "")).strip()
-        if not old_text or not new_text:
-            raise ValueError("edit_server_memory.old_text and new_text are required.")
-        LOGGER.info(
-            "Editing server memory requester=%s guild_id=%s old_chars=%s new_chars=%s",
-            message.author.id,
-            message.guild.id,
-            len(old_text),
-            len(new_text),
-        )
-
-        path, updated = self.guild_memory_store.replace_for_guild(
-            guild_id=message.guild.id,
-            old_text=old_text,
-            new_text=new_text,
-        )
-        if updated:
-            await self._notify_owner_of_guild_memory_update(
-                guild_id=message.guild.id,
-                guild_name=message.guild.name,
-                summary=(
-                    "Owner-approved guild memory edit:\n"
-                    f"- old: {old_text}\n"
-                    f"- new: {new_text}"
-                ),
+        if action == "preview":
+            pending_count = self._pending_passive_guild_message_count(guild_id)
+            self._register_passive_flush_confirmation(
+                guild_id=guild_id,
+                requester_user_id=message.author.id,
+                pending_message_count=pending_count,
             )
-        return {
-            "ok": updated,
-            "guild_id": message.guild.id,
-            "guild_name": message.guild.name,
-            "path": str(path),
-            "old_text": old_text,
-            "new_text": new_text,
-            "status": "updated" if updated else "not_found",
-        }
+            return {
+                "ok": True,
+                "action": "preview",
+                "guild_id": guild_id,
+                "guild_name": guild_name,
+                "pending_message_count": pending_count,
+                "confirmation_required": True,
+                "confirmation_window_seconds": 300,
+                "status": "preview_ready",
+            }
 
-    async def _tool_flush_passive_server_memory(
-        self,
-        arguments: dict[str, Any],
-        tool_context: dict[str, Any],
-    ) -> dict[str, Any]:
-        message: discord.Message = tool_context["message"]
-        self._require_owner(message, "flush_passive_server_memory")
+        if action == "cancel":
+            cancelled = self._discard_passive_flush_confirmation(
+                guild_id=guild_id,
+                requester_user_id=message.author.id,
+            )
+            return {
+                "ok": cancelled,
+                "action": "cancel",
+                "guild_id": guild_id,
+                "guild_name": guild_name,
+                "status": "cancelled" if cancelled else "no_pending_confirmation",
+            }
 
-        requested_guild_id = arguments.get("guild_id")
-        if requested_guild_id is None:
-            if message.guild is None:
-                raise ValueError("flush_passive_server_memory.guild_id is required outside a guild channel.")
-            guild_id = message.guild.id
-        else:
-            guild_id = int(requested_guild_id)
+        # action == "confirm"
         confirmation = self._consume_passive_flush_confirmation(
             guild_id=guild_id,
             requester_user_id=message.author.id,
         )
         if confirmation is None:
             raise ValueError(
-                "Preview required before flush. Call preview_passive_server_memory_flush first, tell the user how many messages are queued, and only flush after they explicitly confirm."
+                "Preview required before confirm. Call passive_flush(action='preview') first, tell the user how many messages are queued, and only confirm after they explicitly say yes."
             )
-        LOGGER.info("Forcing passive server memory flush requester=%s guild_id=%s", message.author.id, guild_id)
-
         if not self._passive_guild_enabled_for_guild(guild_id):
             raise ValueError(f"Passive guild memory is not enabled for guild_id={guild_id}.")
-
         result = await self._flush_passive_guild_memory_now(guild_id)
+        result["action"] = "confirm"
         result["preview_pending_message_count"] = confirmation.pending_message_count
         return result
 
-    async def _tool_preview_passive_server_memory_flush(
-        self,
-        arguments: dict[str, Any],
-        tool_context: dict[str, Any],
-    ) -> dict[str, Any]:
-        del arguments
-        message: discord.Message = tool_context["message"]
-        self._require_owner(message, "preview_passive_server_memory_flush")
-        if message.guild is None:
-            raise ValueError("preview_passive_server_memory_flush requires a guild/server channel.")
-
-        guild_id = message.guild.id
-        pending_count = self._pending_passive_guild_message_count(guild_id)
-        self._register_passive_flush_confirmation(
-            guild_id=guild_id,
-            requester_user_id=message.author.id,
-            pending_message_count=pending_count,
-        )
-        return {
-            "ok": True,
-            "guild_id": guild_id,
-            "guild_name": message.guild.name,
-            "pending_message_count": pending_count,
-            "confirmation_required": True,
-            "confirmation_window_seconds": 300,
-            "status": "preview_ready",
-        }
-
-    async def _tool_cancel_passive_server_memory_flush(
-        self,
-        arguments: dict[str, Any],
-        tool_context: dict[str, Any],
-    ) -> dict[str, Any]:
-        del arguments
-        message: discord.Message = tool_context["message"]
-        self._require_owner(message, "cancel_passive_server_memory_flush")
-        if message.guild is None:
-            raise ValueError("cancel_passive_server_memory_flush requires a guild/server channel.")
-
-        cancelled = self._discard_passive_flush_confirmation(
-            guild_id=message.guild.id,
-            requester_user_id=message.author.id,
-        )
-        return {
-            "ok": cancelled,
-            "guild_id": message.guild.id,
-            "guild_name": message.guild.name,
-            "status": "cancelled" if cancelled else "no_pending_confirmation",
-        }
-
-    async def _tool_send_message(
+    async def _tool_send_dm(
         self,
         arguments: dict[str, Any],
         tool_context: dict[str, Any],
@@ -2477,17 +2421,17 @@ class DiscoAssistant(discord.Client):
 
         requested_target_user_id = arguments.get("target_user_id")
         if requested_target_user_id is None:
-            raise ValueError("send_message.target_user_id is required. Do not guess recipient.")
+            raise ValueError("send_dm.target_user_id is required. Do not guess recipient.")
         target_user_id = self._resolve_target_user_id(message, requested_target_user_id)
 
-        content = str(arguments.get("message", "")).strip()
+        content = str(arguments.get("content", "")).strip()
         if not content:
-            raise ValueError("send_message.message is required.")
+            raise ValueError("send_dm.content is required.")
 
         if not is_owner and target_user_id != owner_user_id:
-            raise ValueError("Only owner can send DMs to arbitrary users.")
+            raise ValueError("Only owner can DM arbitrary users. Non-owner may only target the owner.")
         if self.user is not None and target_user_id == self.user.id:
-            raise ValueError("Do not DM logged-in assistant account.")
+            raise ValueError("Do not DM the logged-in assistant account.")
 
         user = self.get_user(target_user_id)
         if user is None:
@@ -2505,7 +2449,7 @@ class DiscoAssistant(discord.Client):
             "target_user_id": target_user_id,
             "dm_channel_id": dm_channel.id,
             "message_id": sent_message.id,
-            "sent_message": content,
+            "sent_content": content,
         }
 
     def _require_owner(self, message: discord.Message, tool_name: str) -> None:
@@ -2682,41 +2626,34 @@ class DiscoAssistant(discord.Client):
         allowed = enabled_tools.intersection(allowed_tool_names)
         schemas: list[dict[str, Any]] = []
 
-        if "get_channel_history" in allowed:
+        if "read_channel" in allowed:
             schemas.append(
                 {
                     "type": "function",
                     "function": {
-                        "name": "get_channel_history",
+                        "name": "read_channel",
                         "description": (
-                            "Fetch past messages from the current Discord channel or an explicitly referenced channel for context. "
-                            "Use default limit unless more context is needed. To paginate farther "
-                            "back, call again with a smaller before_message_id from an older message."
+                            "Read recent messages from the current Discord channel (or another channel by id). "
+                            "Call when the user references prior context, mentions you with no other text, asks "
+                            "'what were we talking about', or anything that needs scrollback. "
+                            "Default limit is fine; paginate older with before_message_id only if needed."
                         ),
                         "parameters": {
                             "type": "object",
                             "properties": {
                                 "limit": {
                                     "type": "integer",
-                                    "description": (
-                                        "Number of past channel messages to fetch. "
-                                        "Discord default-style history size is fine unless more context is needed."
-                                    ),
+                                    "description": "How many messages to fetch. Default size is usually enough.",
                                     "minimum": 1,
                                     "maximum": 100,
                                 },
                                 "before_message_id": {
                                     "type": "integer",
-                                    "description": (
-                                        "Fetch messages before this message id. "
-                                        "Use returned older message ids to paginate farther back."
-                                    ),
+                                    "description": "Fetch messages older than this id. Use returned older ids to paginate farther.",
                                 },
-                                "target_channel_id": {
+                                "channel_id": {
                                     "type": "integer",
-                                    "description": (
-                                        "Optional explicit Discord channel id. Use this when the user mentions a specific #channel."
-                                    ),
+                                    "description": "Optional explicit Discord channel id. Use when the user names a specific #channel.",
                                 },
                             },
                             "required": [],
@@ -2726,81 +2663,112 @@ class DiscoAssistant(discord.Client):
                 }
             )
 
-        if "append_user_memory" in allowed:
+        if "lookup_user" in allowed:
             schemas.append(
                 {
                     "type": "function",
                     "function": {
-                        "name": "append_user_memory",
+                        "name": "lookup_user",
                         "description": (
-                            "Append durable notes about current Discord user to that user's markdown memory file. "
-                            "Use for useful long-term facts, preferences, plans, personal context, repeated habits, "
-                            "interaction style, response preferences, phrasing patterns, or small reusable details likely to help in future conversations."
+                            "Get profile details for a Discord user (defaults to the current chatter). "
+                            "Use when the user asks who someone is, wants their id or bio, or you need to verify a target before send_dm."
                         ),
                         "parameters": {
                             "type": "object",
                             "properties": {
-                                "note": {
-                                    "type": "string",
-                                    "description": (
-                                        "Short markdown-safe note to append to this user's memory file. "
-                                        "Write concise durable context worth remembering, including collaboration cues like tone, detail level, formatting likes, or recognizable habits."
-                                    ),
+                                "user_id": {
+                                    "type": "integer",
+                                    "description": "Optional Discord user id. Omit to look up the current message author.",
                                 }
                             },
-                            "required": ["note"],
+                            "required": [],
                             "additionalProperties": False,
                         },
                     },
                 }
             )
 
-        if "edit_user_memory" in allowed:
+        if "remember" in allowed:
             schemas.append(
                 {
                     "type": "function",
                     "function": {
-                        "name": "edit_user_memory",
+                        "name": "remember",
                         "description": (
-                            "Update stale or changed facts inside current user's markdown memory file by replacing "
-                            "specific old text with new text. Use when existing memory is wrong, outdated, or changed."
+                            "Owner-only. Save a durable note to memory. "
+                            "scope='user' appends to the current user's memory file (identity, projects, long-term preferences, biographical facts). "
+                            "scope='server' appends to the current guild's shared memory (server-wide rules, channel norms, cues that should affect replies for everyone in this guild). "
+                            "Notes are written under the file's '## Notes' section. Save only things that should still matter next week."
                         ),
                         "parameters": {
                             "type": "object",
                             "properties": {
-                                "old_text": {
+                                "scope": {
                                     "type": "string",
-                                    "description": "Exact existing text snippet from user memory that should be replaced.",
+                                    "enum": ["user", "server"],
+                                    "description": "Which memory file to write to.",
                                 },
-                                "new_text": {
+                                "note": {
                                     "type": "string",
-                                    "description": "New replacement text that should overwrite old_text.",
+                                    "description": "Concise markdown-safe note. One fact per call.",
                                 },
                             },
-                            "required": ["old_text", "new_text"],
+                            "required": ["scope", "note"],
                             "additionalProperties": False,
                         },
                     },
                 }
             )
 
-        if "get_user_memory" in allowed:
+        if "edit_memory" in allowed:
             schemas.append(
                 {
                     "type": "function",
                     "function": {
-                        "name": "get_user_memory",
+                        "name": "edit_memory",
                         "description": (
-                            "Owner-only: read the persistent user memory file for a specific Discord user id."
+                            "Owner-only. Edit a memory file by substring replacement. "
+                            "scope='user' edits the current user's memory; scope='server' edits the current guild's memory. "
+                            "find must be an exact substring; replace overwrites it (use empty string to delete). "
+                            "Use when an existing fact is wrong, outdated, or changed."
                         ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "scope": {
+                                    "type": "string",
+                                    "enum": ["user", "server"],
+                                    "description": "Which memory file to edit.",
+                                },
+                                "find": {
+                                    "type": "string",
+                                    "description": "Exact substring already in the memory file.",
+                                },
+                                "replace": {
+                                    "type": "string",
+                                    "description": "Replacement text. Empty string deletes the matched substring.",
+                                },
+                            },
+                            "required": ["scope", "find", "replace"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            )
+
+        if "read_user_memory" in allowed:
+            schemas.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_user_memory",
+                        "description": "Owner-only. Read the memory file for a specific Discord user id.",
                         "parameters": {
                             "type": "object",
                             "properties": {
                                 "target_user_id": {
                                     "type": "integer",
-                                    "description": (
-                                        "Discord user id whose memory file should be read."
-                                    ),
+                                    "description": "Discord user id whose memory file to read.",
                                 }
                             },
                             "required": ["target_user_id"],
@@ -2810,182 +2778,63 @@ class DiscoAssistant(discord.Client):
                 }
             )
 
-        if "append_server_memory" in allowed:
+        if "passive_flush" in allowed:
             schemas.append(
                 {
                     "type": "function",
                     "function": {
-                        "name": "append_server_memory",
+                        "name": "passive_flush",
                         "description": (
-                            "Owner-only: append a server-wide rule, policy, or durable guild fact to the current server memory. "
-                            "Use this for instructions from the real owner that should apply across the whole server, not just to the owner, plus durable shared norms or interaction patterns."
+                            "Owner-only. Manage the passive server-memory queue for the current guild. "
+                            "action='preview' shows how many messages are queued and starts a confirmation window — call this first. "
+                            "action='confirm' summarizes the queue into server memory; only call after preview AND explicit owner yes in the same turn-pair. "
+                            "action='cancel' discards a pending confirmation when the owner says no."
                         ),
                         "parameters": {
                             "type": "object",
                             "properties": {
-                                "note": {
+                                "action": {
                                     "type": "string",
-                                    "description": (
-                                        "Short markdown-safe note to append to this server's memory file."
-                                    ),
-                                }
-                            },
-                            "required": ["note"],
-                            "additionalProperties": False,
-                        },
-                    },
-                }
-            )
-
-        if "edit_server_memory" in allowed:
-            schemas.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "edit_server_memory",
-                        "description": (
-                            "Owner-only: update stale or changed server-wide rules or facts inside current server memory."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "old_text": {
-                                    "type": "string",
-                                    "description": "Exact existing text snippet from server memory that should be replaced.",
+                                    "enum": ["preview", "confirm", "cancel"],
+                                    "description": "Step of the flush workflow.",
                                 },
-                                "new_text": {
-                                    "type": "string",
-                                    "description": "New replacement text that should overwrite old_text.",
-                                },
-                            },
-                            "required": ["old_text", "new_text"],
-                            "additionalProperties": False,
-                        },
-                    },
-                }
-            )
-
-        if "preview_passive_server_memory_flush" in allowed:
-            schemas.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "preview_passive_server_memory_flush",
-                        "description": (
-                            "Owner-only: check how many passive server-memory messages are queued for the current server and start a confirmation window. "
-                            "Use this first when the owner asks to flush passive server memory. After calling this, tell the owner the queued count and ask whether to continue. "
-                            "Do not call flush_passive_server_memory until the owner explicitly confirms."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {},
-                            "required": [],
-                            "additionalProperties": False,
-                        },
-                    },
-                }
-            )
-
-        if "cancel_passive_server_memory_flush" in allowed:
-            schemas.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "cancel_passive_server_memory_flush",
-                        "description": (
-                            "Owner-only: cancel a pending passive server-memory flush confirmation for the current server. "
-                            "Use this when the owner says no, cancel, stop, or otherwise declines the flush after a preview."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {},
-                            "required": [],
-                            "additionalProperties": False,
-                        },
-                    },
-                }
-            )
-
-        if "flush_passive_server_memory" in allowed:
-            schemas.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "flush_passive_server_memory",
-                        "description": (
-                            "Owner-only: force the passive guild memory queue to summarize now for the current server, "
-                            "or for an explicit guild id. Only use this after preview_passive_server_memory_flush was called and the owner explicitly confirmed they want to continue."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
                                 "guild_id": {
                                     "type": "integer",
-                                    "description": (
-                                        "Optional guild/server id. Leave unset in a server channel to use the current guild."
-                                    ),
-                                }
-                            },
-                            "required": [],
-                            "additionalProperties": False,
-                        },
-                    },
-                }
-            )
-
-        if "get_user_details" in allowed:
-            schemas.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "get_user_details",
-                        "description": (
-                            "Fetch profile details for current chatter by default, or for an explicit Discord user id. "
-                            "Use this when user asks who someone is, wants their user id, bio, profile details, "
-                            "or more context about the current chatter."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "target_user_id": {
-                                    "type": "integer",
-                                    "description": (
-                                        "Optional Discord user id to inspect. Omit to inspect current message author."
-                                    ),
-                                }
-                            },
-                            "required": [],
-                            "additionalProperties": False,
-                        },
-                    },
-                }
-            )
-
-        if "send_message" in allowed:
-            schemas.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "send_message",
-                        "description": (
-                            "Send direct message to Discord user. Non-owner users may only message owner. "
-                            "Owner may message any user. Never use this unless target user id is explicit."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "target_user_id": {
-                                    "type": "integer",
-                                    "description": (
-                                        "Discord user id to DM. Required. Use owner user id when user wants to message owner."
-                                    ),
+                                    "description": "Optional explicit guild id. Omit in a server channel to use the current guild.",
                                 },
-                                "message": {
+                            },
+                            "required": ["action"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            )
+
+        if "send_dm" in allowed:
+            schemas.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "send_dm",
+                        "description": (
+                            "Send a direct message to a specific Discord user. "
+                            "target_user_id MUST come from a mention, lookup_user, or prior context — never guess. "
+                            "Non-owner can only target the owner; owner can target anyone. "
+                            "Never claim the message was sent unless this tool returned ok=true."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "target_user_id": {
+                                    "type": "integer",
+                                    "description": "Discord user id to DM. Required.",
+                                },
+                                "content": {
                                     "type": "string",
-                                    "description": "Direct message content to send.",
+                                    "description": "Message text to send.",
                                 },
                             },
-                            "required": ["target_user_id", "message"],
+                            "required": ["target_user_id", "content"],
                             "additionalProperties": False,
                         },
                     },
@@ -2999,7 +2848,7 @@ class DiscoAssistant(discord.Client):
             return {
                 "type": "function",
                 "function": {
-                    "name": "get_channel_history",
+                    "name": "read_channel",
                 },
             }
         return "auto"
@@ -3362,7 +3211,7 @@ class DiscoAssistant(discord.Client):
                         return f"Couldn't do that: {error_message}"
                     return "Couldn't do that."
 
-                if item.get("name") == "send_message" and payload.get("ok") is True:
+                if item.get("name") == "send_dm" and payload.get("ok") is True:
                     target_user_id = payload.get("target_user_id")
                     return f"Message sent to user `{target_user_id}`."
 

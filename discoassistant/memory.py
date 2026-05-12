@@ -1,8 +1,93 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
+
+
+NOTES_HEADER = "## Notes"
+OWNER_RULES_HEADER = "## Owner Rules"
+
+
+def _append_to_section(content: str, header: str, line: str, default_after_header_blank: bool = True) -> str:
+    """Insert `line` into the section identified by `header`.
+
+    Behavior:
+    - If header exists, append the bullet at the end of that section (before the
+      next `## ` heading or the end of file).
+    - If header does not exist, append the section to the end of the file with
+      the bullet under it.
+    """
+    lines = content.rstrip().splitlines() if content.strip() else []
+    header_index: int | None = None
+    for index, candidate in enumerate(lines):
+        if candidate.strip() == header:
+            header_index = index
+            break
+
+    if header_index is None:
+        rebuilt = list(lines)
+        if rebuilt and rebuilt[-1] != "":
+            rebuilt.append("")
+        rebuilt.append(header)
+        if default_after_header_blank:
+            rebuilt.append("")
+        rebuilt.append(line)
+        return "\n".join(rebuilt) + "\n"
+
+    section_end = len(lines)
+    for index in range(header_index + 1, len(lines)):
+        if lines[index].startswith("## "):
+            section_end = index
+            break
+
+    insert_at = section_end
+    while insert_at > header_index + 1 and lines[insert_at - 1].strip() == "":
+        insert_at -= 1
+
+    rebuilt = lines[:insert_at] + [line] + lines[insert_at:]
+    return "\n".join(rebuilt) + "\n"
+
+
+def _section_lines(content: str, header: str) -> list[str]:
+    """Return the bullet lines (raw, including '- ' prefix) under `header`."""
+    if not content.strip():
+        return []
+    lines = content.splitlines()
+    start = None
+    for index, candidate in enumerate(lines):
+        if candidate.strip() == header:
+            start = index + 1
+            break
+    if start is None:
+        return []
+    out: list[str] = []
+    for line in lines[start:]:
+        if line.startswith("## "):
+            break
+        if line.strip().startswith("- "):
+            out.append(line.strip())
+    return out
+
+
+def _strip_section(content: str, header: str) -> str:
+    if not content.strip():
+        return content
+    lines = content.splitlines()
+    output: list[str] = []
+    in_section = False
+    for line in lines:
+        if line.strip() == header:
+            in_section = True
+            continue
+        if in_section and line.startswith("## "):
+            in_section = False
+        if in_section:
+            continue
+        output.append(line)
+    cleaned = "\n".join(output)
+    while "\n\n\n" in cleaned:
+        cleaned = cleaned.replace("\n\n\n", "\n\n")
+    return cleaned.strip() + ("\n" if cleaned.strip() else "")
 
 
 @dataclass(slots=True)
@@ -41,25 +126,23 @@ class UserMemoryStore:
         user_id: int,
         note: str,
         author_display_name: str | None = None,
-        source_channel_id: int | None = None,
+        source_channel_id: int | None = None,  # kept for back-compat; not used in line
     ) -> Path:
+        del source_channel_id
         path = self.path_for_user(user_id)
-        timestamp = datetime.now(UTC).replace(microsecond=0).isoformat()
         safe_note = note.strip()
         if not safe_note:
             raise ValueError("Memory note cannot be empty.")
 
         if path.exists():
-            existing = path.read_text(encoding="utf-8").rstrip()
+            existing = path.read_text(encoding="utf-8")
         else:
             existing = self._new_file_header(
                 user_id=user_id,
                 author_display_name=author_display_name,
-            ).rstrip()
+            )
 
-        channel_suffix = f" | channel {source_channel_id}" if source_channel_id is not None else ""
-        entry = f"- [{timestamp}{channel_suffix}] {safe_note}"
-        new_content = f"{existing}\n{entry}\n"
+        new_content = _append_to_section(existing, NOTES_HEADER, f"- {safe_note}")
         path.write_text(new_content, encoding="utf-8")
         return path
 
@@ -76,8 +159,8 @@ class UserMemoryStore:
 
         old_value = old_text.strip()
         new_value = new_text.strip()
-        if not old_value or not new_value:
-            raise ValueError("Both old_text and new_text are required.")
+        if not old_value:
+            raise ValueError("old_text is required.")
 
         content = path.read_text(encoding="utf-8")
         if old_value not in content:
@@ -92,9 +175,10 @@ class UserMemoryStore:
         display_name = author_display_name or "unknown"
         return (
             f"# User Memory: {user_id}\n\n"
-            f"- User ID: {user_id}\n"
-            f"- Last known display name: {display_name}\n"
-            f"- Notes:\n"
+            f"## Identity\n"
+            f"- user_id: {user_id}\n"
+            f"- display_name: {display_name}\n\n"
+            f"## Notes\n"
         )
 
 
@@ -102,7 +186,7 @@ class UserMemoryStore:
 class GuildMemoryStore:
     base_dir: Path
     max_chars_in_prompt: int = 6000
-    owner_rules_header: str = "## Owner Rules"
+    owner_rules_header: str = OWNER_RULES_HEADER
 
     def __post_init__(self) -> None:
         self.base_dir.mkdir(parents=True, exist_ok=True)
@@ -139,32 +223,29 @@ class GuildMemoryStore:
         guild_id: int,
         note: str,
         guild_name: str | None = None,
-        author_display_name: str | None = None,
-        source_channel_id: int | None = None,
+        author_display_name: str | None = None,  # kept for back-compat; not used in line
+        source_channel_id: int | None = None,    # kept for back-compat; not used in line
         owner_priority: bool = False,
     ) -> Path:
+        del author_display_name, source_channel_id
         path = self.path_for_guild(guild_id)
-        timestamp = datetime.now(UTC).replace(microsecond=0).isoformat()
         safe_note = note.strip()
         if not safe_note:
             raise ValueError("Server memory note cannot be empty.")
 
         if path.exists():
-            existing = path.read_text(encoding="utf-8").rstrip()
+            existing = path.read_text(encoding="utf-8")
         else:
             existing = self._new_file_header(
                 guild_id=guild_id,
                 guild_name=guild_name,
-            ).rstrip()
+            )
 
         if owner_priority:
             normalized_rule = self._normalize_owner_rule_text(safe_note)
             new_content = self._upsert_owner_rules(existing, [normalized_rule])
         else:
-            author_suffix = f" | by {author_display_name}" if author_display_name else ""
-            channel_suffix = f" | channel {source_channel_id}" if source_channel_id is not None else ""
-            entry = f"- [{timestamp}{channel_suffix}{author_suffix}] {safe_note}"
-            new_content = f"{existing}\n{entry}\n"
+            new_content = _append_to_section(existing, NOTES_HEADER, f"- {safe_note}")
         path.write_text(new_content, encoding="utf-8")
         return path
 
@@ -181,8 +262,8 @@ class GuildMemoryStore:
 
         old_value = old_text.strip()
         new_value = new_text.strip()
-        if not old_value or not new_value:
-            raise ValueError("Both old_text and new_text are required.")
+        if not old_value:
+            raise ValueError("old_text is required.")
 
         content = path.read_text(encoding="utf-8")
         if old_value not in content:
@@ -222,52 +303,23 @@ class GuildMemoryStore:
         safe_guild_name = guild_name or "unknown"
         return (
             f"# Server Memory: {guild_id}\n\n"
-            f"- Guild ID: {guild_id}\n"
-            f"- Last known guild name: {safe_guild_name}\n"
+            f"## Server Info\n"
+            f"- guild_id: {guild_id}\n"
+            f"- name: {safe_guild_name}\n\n"
+            f"## Owner Rules\n\n"
+            f"## Notes\n"
         )
 
     def extract_owner_rules(self, content: str) -> list[str]:
-        if not content.strip():
-            return []
-        lines = content.splitlines()
-        start_index = None
-        for index, line in enumerate(lines):
-            if line.strip() == self.owner_rules_header:
-                start_index = index + 1
-                break
-        if start_index is None:
-            return []
-
         rules: list[str] = []
-        for line in lines[start_index:]:
-            stripped = line.strip()
-            if stripped.startswith("## "):
-                break
-            if stripped.startswith("- "):
-                normalized = self._normalize_owner_rule_text(stripped[2:])
-                if normalized:
-                    rules.append(normalized)
+        for raw in _section_lines(content, self.owner_rules_header):
+            normalized = self._normalize_owner_rule_text(raw[2:] if raw.startswith("- ") else raw)
+            if normalized:
+                rules.append(normalized)
         return self._dedupe_owner_rules(rules)
 
     def strip_owner_rules_section(self, content: str) -> str:
-        if not content.strip():
-            return content
-        lines = content.splitlines()
-        output: list[str] = []
-        in_owner_rules = False
-        for line in lines:
-            stripped = line.strip()
-            if stripped == self.owner_rules_header:
-                in_owner_rules = True
-                continue
-            if in_owner_rules and stripped.startswith("## "):
-                in_owner_rules = False
-            if in_owner_rules:
-                continue
-            output.append(line)
-        cleaned = "\n".join(output)
-        cleaned = cleaned.replace("\n\n\n", "\n\n")
-        return cleaned.strip() + ("\n" if cleaned.strip() else "")
+        return _strip_section(content, self.owner_rules_header)
 
     def _upsert_owner_rules(self, content: str, new_rules: list[str]) -> str:
         merged_rules = self._dedupe_owner_rules([*self.extract_owner_rules(content), *new_rules])
