@@ -78,7 +78,6 @@ async def handler(arguments: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
         history.append(
             {
                 "message_id": item.id,
-                "author_user_id": item.author.id,
                 "author_username": str(item.author),
                 "author_display_name": services.display_name_for_message_author(item),
                 "content": services.message_text_for_context(item),
