@@ -96,7 +96,7 @@ class ReplyPromptBuilder:
         conversation = None if is_dm else self._get_active_conversation(message)
         mention_only = self._is_mention_without_other_text(message)
         prefetched_channel_context = ""
-        if not is_dm and (mention_only or self._should_prefetch_channel_context(message)):
+        if not is_dm:
             prefetched_channel_context = await self._prefetch_channel_history_for_message(message)
         memory_context = self._user_memory_context_for_message(message)
         server_memory_context = "" if is_dm else self._server_memory_context_for_message(message)
@@ -132,15 +132,27 @@ class ReplyPromptBuilder:
         memory_block = "\n\n".join(memory_parts) if memory_parts else ""
 
         # System block #3 — per-turn runtime context.
+        author_id = message.author.id
+        is_author_owner = author_id == self._owner_user_id
         runtime_lines: list[str] = []
         runtime_lines.append(
-            f"Author: {self._display_name_for_message_author(message)} "
-            f"(username {message.author}, id {message.author.id})"
+            f"CURRENT_AUTHOR: user_id={author_id} "
+            f"display_name={self._display_name_for_message_author(message)} "
+            f"username={message.author}"
         )
         runtime_lines.append(
-            "Author is the owner."
-            if message.author.id == self._owner_user_id
-            else "Author is NOT the owner."
+            f"OWNER_USER_ID: {self._owner_user_id}. "
+            + (
+                "Current author IS the owner."
+                if is_author_owner
+                else "Current author is NOT the owner. Do not address them by the owner's name or treat them as the owner."
+            )
+        )
+        LOGGER.debug(
+            "prompt author_id=%s owner_id=%s author_is_owner=%s",
+            author_id,
+            self._owner_user_id,
+            is_author_owner,
         )
         if is_dm:
             runtime_lines.append("Channel: DM. Use only user memory; server memory does not apply.")
@@ -175,8 +187,6 @@ class ReplyPromptBuilder:
 
         if is_dm:
             messages.extend(self._dm_conversation_context_for_message(message))
-        elif conversation is not None:
-            messages.extend(conversation.messages)
 
         if runtime_block:
             messages.append({"role": "system", "content": runtime_block})
@@ -184,9 +194,13 @@ class ReplyPromptBuilder:
         if is_dm:
             user_message: dict[str, Any] | None = None
         else:
+            user_text = self._message_text_for_context(message) or "(no text)"
             user_message = {
                 "role": "user",
-                "content": self._message_text_for_context(message) or "(no text)",
+                "content": (
+                    f"{user_text}\n\n"
+                    f"(Reply to user_id={author_id}. Address them as the asker.)"
+                ),
             }
             messages.append(user_message)
 

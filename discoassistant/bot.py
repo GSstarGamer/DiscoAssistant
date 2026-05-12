@@ -920,8 +920,10 @@ class DiscoAssistant(discord.Client):
         lines = ["Recent channel context:"]
         for item in reversed(history_messages):
             author_name = item.get("author_display_name") or item.get("author_username") or "unknown"
+            author_user_id = item.get("author_user_id")
             content = (item.get("content") or "").strip() or "(no text)"
-            lines.append(f"- {author_name}: {content}")
+            id_tag = f"[id={author_user_id}] " if author_user_id is not None else ""
+            lines.append(f"- {id_tag}{author_name}: {content}")
         lines.append("")
         return "\n".join(lines)
 
@@ -1396,10 +1398,6 @@ class DiscoAssistant(discord.Client):
         prompt_lines = [
             "Owner profile:",
             f"- owner_user_id: {owner_user_id}",
-            f"- owner_username: {owner_user}",
-            f"- owner_name: {getattr(owner_user, 'name', str(owner_user))}",
-            f"- owner_display_name: {getattr(owner_user, 'display_name', str(owner_user))}",
-            f"- owner_global_name: {getattr(owner_user, 'global_name', None) or '(none)'}",
             f"- owner_mention: {getattr(owner_user, 'mention', f'<@{owner_user_id}>')}",
             f"- owner_bio: {owner_bio or '(none)'}",
             (

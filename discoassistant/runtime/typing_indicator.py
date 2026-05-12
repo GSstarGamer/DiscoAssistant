@@ -20,10 +20,11 @@ class TypingHeartbeat:
     async def run(self) -> None:
         while not self._stop.is_set():
             try:
-                await self.channel.trigger_typing()
-            except (discord.HTTPException, AttributeError, asyncio.CancelledError):
-                if self._stop.is_set():
-                    return
+                await self.channel.typing()
+            except discord.HTTPException:
+                pass
+            except asyncio.CancelledError:
+                return
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=8.0)
             except asyncio.TimeoutError:
@@ -47,7 +48,7 @@ class TypingHeartbeatRegistry:
     def ensure_running(self, key: ConversationKey, channel: Any) -> None:
         if key in self._heartbeats:
             return
-        if not hasattr(channel, "trigger_typing"):
+        if not hasattr(channel, "typing"):
             return
         heartbeat = TypingHeartbeat(channel)
         self._heartbeats[key] = heartbeat
