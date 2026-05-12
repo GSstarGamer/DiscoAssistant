@@ -64,6 +64,12 @@ class MemoryConfig(BaseModel):
     dm_history_db_path: str = "memories/dm_history.sqlite3"
     max_user_chars_in_prompt: int = 6000
     max_guild_chars_in_prompt: int = 6000
+    dm_max_recent_turns: int = 30
+    dm_summary_threshold_turns: int = 50
+    dm_summary_keep_recent_turns: int = 10
+    dm_summary_model: str | None = None
+    dm_summary_max_output_tokens: int = 1500
+    dm_summary_temperature: float = 0.2
 
 
 class PassiveGuildMemoryConfig(BaseModel):

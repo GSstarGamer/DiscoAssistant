@@ -1,51 +1,52 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
-from collections import deque
-from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from time import monotonic
 from typing import Any
 from collections.abc import Iterable
 
-import aiohttp
 import discord
+from pathlib import Path
 
 from discoassistant.config import BASE_DIR, AppConfig, load_app_config
 from discoassistant.dm_history import DmHistoryStore
+from discoassistant.errors.formatter import (
+    fallback_response_text,
+    safe_runtime_error_reply,
+    synthesize_deterministic_reply,
+)
+from discoassistant.llm.memory_capture import OwnerMemoryCapturer
+from discoassistant.llm.openrouter import OpenRouterClient
+from discoassistant.llm.prompt_builder import ReplyPromptBuilder
+from discoassistant.llm.response import extract_response_text
+from discoassistant.llm.tool_loop import ToolLoopRunner
+from discoassistant.llm.tool_registry import ToolContext
+from discoassistant.llm.tools import build_default_registry
 from discoassistant.memory import GuildMemoryStore, UserMemoryStore
+from discoassistant.passive_guild import OwnerNotifier, PassiveGuildPoller, PassiveGuildSummarizer
 from discoassistant.passive_guild_history import PassiveGuildHistoryStore
+from discoassistant.runtime import (
+    ActiveConversation,
+    ConversationKey,
+    ConversationStore,
+    InFlightTaskRegistry,
+    MessageDebouncer,
+    PassiveFlushConfirmationStore,
+    PendingReplyManager,
+    RecentResponseIds,
+    TokenMeter,
+    TypingHeartbeatRegistry,
+    conversation_key,
+)
 
 
 LOGGER = logging.getLogger("discoassistant")
 
-
-@dataclass(slots=True)
-class ActiveConversation:
-    messages: list[dict[str, str]] = field(default_factory=list)
-    expires_at: float = 0.0
-    interrupted_by_other_user: bool = False
-
-
-@dataclass(slots=True)
-class PendingReply:
-    message: discord.Message
-    updated_at: float
-    first_seen_at: float
-    started_from_mention: bool
-    started_from_active_conversation: bool
-    messages: list[discord.Message] = field(default_factory=list)
-
-
-@dataclass(slots=True)
-class PendingPassiveFlushConfirmation:
-    guild_id: int
-    requester_user_id: int
-    pending_message_count: int
-    expires_at: float
+PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 
 class DiscoAssistant(discord.Client):
@@ -53,19 +54,36 @@ class DiscoAssistant(discord.Client):
         super().__init__()
         self.app_config = app_config
         self._startup_announced = False
-        self.http_session: aiohttp.ClientSession | None = None
+        self.token_meter = TokenMeter(on_change=self._schedule_presence_refresh)
+        self.openrouter = OpenRouterClient(
+            api_key=app_config.settings.openrouter_api_key,
+            base_url=app_config.runtime.openrouter.base_url,
+            app_name=app_config.runtime.openrouter.app_name,
+            site_url=app_config.runtime.openrouter.site_url,
+            default_model=app_config.runtime.openrouter.default_model,
+            on_token_usage=self.token_meter.record,
+        )
         self._owner_context_prompt_cache: str | None = None
-        self._recent_response_ids: deque[int] = deque(maxlen=200)
-        self._active_conversations: dict[tuple[int, int], ActiveConversation] = {}
-        self._pending_replies: dict[tuple[int, int], PendingReply] = {}
-        self._reply_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
-        self._reply_generation_in_progress: set[tuple[int, int]] = set()
-        self._session_total_tokens_used = 0
+        self._assistant_identity_cache: str | None = None
+        self._static_system_prompt: str = self._load_static_system_prompt()
+        self.response_dedup = RecentResponseIds(maxlen=200)
+        self.conversation_store = ConversationStore(
+            window_seconds=self.app_config.runtime.discord.conversation_window_seconds,
+            messages_cap=12,
+        )
+        self.pending = PendingReplyManager(
+            signal_callback=lambda k: self.debouncer.signal(k),
+        )
+        self.debouncer = MessageDebouncer(
+            window_seconds=self.app_config.runtime.discord.reply_debounce_seconds,
+            pending_lookup=self.pending.get,
+        )
+        self.in_flight = InFlightTaskRegistry()
+        self.typing_registry = TypingHeartbeatRegistry()
+        self._dm_summary_in_flight: set[int] = set()
         self._presence_update_task: asyncio.Task[None] | None = None
         self._presence_refresh_requested = False
-        self._passive_guild_poller_task: asyncio.Task[None] | None = None
-        self._passive_guild_summary_tasks: dict[int, asyncio.Task[None]] = {}
-        self._pending_passive_flush_confirmations: dict[tuple[int, int], PendingPassiveFlushConfirmation] = {}
+        self.flush_confirmations = PassiveFlushConfirmationStore()
         self.user_memory_store = UserMemoryStore(
             base_dir=BASE_DIR / self.app_config.runtime.memory.user_directory,
             max_chars_in_prompt=self.app_config.runtime.memory.max_user_chars_in_prompt,
@@ -80,27 +98,180 @@ class DiscoAssistant(discord.Client):
         self.passive_guild_history_store = PassiveGuildHistoryStore(
             db_path=BASE_DIR / self.app_config.runtime.passive_guild_memory.db_path,
         )
+        self.owner_memory_capturer = OwnerMemoryCapturer(
+            openrouter_client=self.openrouter,
+            user_memory_store=self.user_memory_store,
+            guild_memory_store=self.guild_memory_store,
+            owner_user_id=self.app_config.settings.owner_user_id,
+            owner_agent=self.app_config.runtime.agents["owner"],
+            memory_enabled=self.app_config.runtime.memory.enabled,
+            message_text_for_context=self._message_text_for_context,
+            is_direct_message=self._is_direct_message,
+            is_mention_without_other_text=self._is_mention_without_other_text,
+            conversation_key=self._conversation_key,
+            server_memory_context_for_message=self._server_memory_context_for_message,
+            display_name_for_message_author=self._display_name_for_message_author,
+        )
+        self.owner_notifier = OwnerNotifier(
+            send_dm_to_owner=self._send_dm_to_owner,
+        )
+        self.passive_summarizer = PassiveGuildSummarizer(
+            openrouter_client=self.openrouter,
+            passive_guild_history_store=self.passive_guild_history_store,
+            guild_memory_store=self.guild_memory_store,
+            passive_config=self.app_config.runtime.passive_guild_memory,
+            owner_notifier=self.owner_notifier,
+            get_guild_name=self._guild_name_for_id,
+        )
+        self.passive_poller = PassiveGuildPoller(
+            passive_guild_history_store=self.passive_guild_history_store,
+            passive_config=self.app_config.runtime.passive_guild_memory,
+            summarizer=self.passive_summarizer,
+            is_closed=self.is_closed,
+        )
+        self.tool_registry = build_default_registry(self)
+        self.tool_loop = ToolLoopRunner(
+            openrouter_client=self.openrouter,
+            registry=self.tool_registry,
+            max_calls_per_turn=self.app_config.runtime.tool_policy.max_calls_per_turn,
+        )
+        self.prompt_builder = ReplyPromptBuilder(
+            static_system_prompt=self._static_system_prompt,
+            memory_enabled=self.app_config.runtime.memory.enabled,
+            owner_user_id=self.app_config.settings.owner_user_id,
+            agent_for_message=self._agent_for_message,
+            owner_context_prompt=self._owner_context_prompt,
+            assistant_identity_prompt=self._assistant_identity_prompt,
+            is_direct_message=self._is_direct_message,
+            is_mention_without_other_text=self._is_mention_without_other_text,
+            get_active_conversation=self._get_active_conversation,
+            should_prefetch_channel_context=self._should_prefetch_channel_context,
+            prefetch_channel_history_for_message=self._prefetch_channel_history_for_message,
+            user_memory_context_for_message=self._user_memory_context_for_message,
+            server_memory_context_for_message=self._server_memory_context_for_message,
+            pending_burst_context=self._pending_burst_context_for_builder,
+            reply_reference_context=self._reply_reference_context,
+            passive_flush_confirmation_context=self.flush_confirmations.context_for_message,
+            dm_conversation_context_for_message=self._dm_conversation_context_for_message,
+            dm_summary_block_for_user=self._dm_summary_block_for_user,
+            message_text_for_context=self._message_text_for_context,
+            display_name_for_message_author=self._display_name_for_message_author,
+            mentioned_users_context=self._mentioned_users_context,
+            mentioned_channels_context=self._mentioned_channels_context,
+            tool_schemas_for_agent=self._tool_schemas_for_agent,
+            tool_choice_for_message=self._tool_choice_for_message,
+            tool_calls_allowed=self.app_config.runtime.tool_policy.allow_model_tool_calls,
+        )
+
+    # ------------------------------------------------------------------
+    # BotServices protocol surface (used by tool handlers and helpers).
+    # ------------------------------------------------------------------
+
+    @property
+    def owner_user_id(self) -> int:
+        return self.app_config.settings.owner_user_id
+
+    @property
+    def user_id(self) -> int | None:
+        return self.user.id if self.user is not None else None
+
+    def display_name_for_message_author(self, message: discord.Message) -> str:
+        return self._display_name_for_message_author(message)
+
+    def message_text_for_context(self, message: discord.Message) -> str:
+        return self._message_text_for_context(message)
+
+    def channel_from_message_context(
+        self,
+        message: discord.Message,
+        channel_id: int,
+    ) -> Any:
+        return self._channel_from_message_context(message, channel_id)
+
+    def member_from_message_context(
+        self,
+        message: discord.Message,
+        user_id: int,
+    ) -> Any:
+        return self._member_from_message_context(message, user_id)
+
+    def user_from_message_context(
+        self,
+        message: discord.Message,
+        user_id: int,
+    ) -> Any:
+        return self._user_from_message_context(message, user_id)
+
+    def resolve_target_user_id(self, message: discord.Message, raw_value: Any) -> int:
+        return self._resolve_target_user_id(message, raw_value)
+
+    def store_historical_dm_message(self, message: discord.Message) -> None:
+        self._store_historical_dm_message(message)
+
+    def store_outgoing_dm_message(self, message: discord.Message) -> None:
+        self._store_outgoing_dm_message(message)
+
+    def is_direct_message(self, message: discord.Message) -> bool:
+        return self._is_direct_message(message)
+
+    def max_history_messages(self) -> int:
+        return self.app_config.runtime.discord.max_history_messages
+
+    def register_passive_flush_confirmation(
+        self,
+        *,
+        guild_id: int,
+        requester_user_id: int,
+        pending_message_count: int,
+    ) -> None:
+        self.flush_confirmations.register(
+            guild_id=guild_id,
+            requester_user_id=requester_user_id,
+            pending_message_count=pending_message_count,
+        )
+
+    def consume_passive_flush_confirmation(
+        self,
+        *,
+        guild_id: int,
+        requester_user_id: int,
+    ) -> Any:
+        return self.flush_confirmations.consume(
+            guild_id=guild_id,
+            requester_user_id=requester_user_id,
+        )
+
+    def discard_passive_flush_confirmation(
+        self,
+        *,
+        guild_id: int,
+        requester_user_id: int,
+    ) -> bool:
+        return self.flush_confirmations.discard(
+            guild_id=guild_id,
+            requester_user_id=requester_user_id,
+        )
+
+    def _pending_burst_context_for_builder(
+        self,
+        pending_messages: list[discord.Message] | None,
+        latest_message_id: int,
+    ) -> str:
+        return self._pending_burst_context(
+            pending_messages,
+            latest_message_id=latest_message_id,
+        )
 
     async def setup_hook(self) -> None:
-        headers = {
-            "Authorization": f"Bearer {self.app_config.settings.openrouter_api_key}",
-            "Content-Type": "application/json",
-            "X-Title": self.app_config.runtime.openrouter.app_name,
-        }
-        if self.app_config.runtime.openrouter.site_url:
-            headers["HTTP-Referer"] = self.app_config.runtime.openrouter.site_url
-
-        self.http_session = aiohttp.ClientSession(
-            headers=headers
-        )
+        await self.openrouter.setup()
         LOGGER.info(
-            "setup_hook complete. Async HTTP session created for model %s.",
+            "setup_hook complete. OpenRouter client ready for model %s.",
             self.app_config.runtime.openrouter.default_model,
         )
 
     async def on_ready(self) -> None:
         await self._apply_configured_presence()
-        self._ensure_passive_guild_poller()
+        self.passive_poller.ensure_running()
 
         if self._startup_announced:
             LOGGER.info("Reconnected as %s (%s)", self.user, self.user.id if self.user else "unknown")
@@ -180,7 +351,7 @@ class DiscoAssistant(discord.Client):
 
         try:
             return presence_config.token_usage_name_template.format(
-                total_tokens=self._session_total_tokens_used,
+                total_tokens=self.token_meter.total,
             )
         except Exception:
             LOGGER.exception(
@@ -200,7 +371,7 @@ class DiscoAssistant(discord.Client):
             return presence_config.state
 
         try:
-            return template.format(total_tokens=self._session_total_tokens_used)
+            return template.format(total_tokens=self.token_meter.total)
         except Exception:
             LOGGER.exception(
                 "Invalid token usage state template %r. Falling back to default state.",
@@ -219,25 +390,13 @@ class DiscoAssistant(discord.Client):
             return presence_config.details
 
         try:
-            return template.format(total_tokens=self._session_total_tokens_used)
+            return template.format(total_tokens=self.token_meter.total)
         except Exception:
             LOGGER.exception(
                 "Invalid token usage details template %r. Falling back to default details.",
                 template,
             )
             return presence_config.details
-
-    def _record_token_usage(self, response_payload: dict[str, Any]) -> None:
-        usage = response_payload.get("usage")
-        if not isinstance(usage, dict):
-            return
-
-        total_tokens = usage.get("total_tokens")
-        if not isinstance(total_tokens, int) or total_tokens <= 0:
-            return
-
-        self._session_total_tokens_used += total_tokens
-        self._schedule_presence_refresh()
 
     def _schedule_presence_refresh(self) -> None:
         presence_config = self.app_config.runtime.discord.presence
@@ -263,661 +422,17 @@ class DiscoAssistant(discord.Client):
         finally:
             self._presence_update_task = None
 
-    def _ensure_passive_guild_poller(self) -> None:
-        passive_config = self.app_config.runtime.passive_guild_memory
-        if not passive_config.enabled:
-            return
-        if self._passive_guild_poller_task is not None and not self._passive_guild_poller_task.done():
-            return
-        self._passive_guild_poller_task = asyncio.create_task(self._passive_guild_poller_loop())
-
-    async def _passive_guild_poller_loop(self) -> None:
-        poll_interval = max(5, self.app_config.runtime.passive_guild_memory.poll_interval_seconds)
-        try:
-            while not self.is_closed():
-                try:
-                    await self._scan_passive_guild_memory()
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    LOGGER.exception("Passive guild memory scan failed.")
-                await asyncio.sleep(poll_interval)
-        except asyncio.CancelledError:
-            raise
-        finally:
-            self._passive_guild_poller_task = None
-
-    async def _scan_passive_guild_memory(self) -> None:
-        enabled_guild_ids = self.app_config.runtime.passive_guild_memory.enabled_guild_ids
-        guild_ids = self.passive_guild_history_store.list_guild_ids_with_pending_messages(
-            enabled_guild_ids=enabled_guild_ids,
-        )
-        for guild_id in guild_ids:
-            await self._maybe_start_passive_guild_summary_for_guild(guild_id)
-
-    async def _maybe_start_passive_guild_summary_for_guild(self, guild_id: int) -> None:
-        if not self._passive_guild_enabled_for_guild(guild_id):
-            return
-
-        running_task = self._passive_guild_summary_tasks.get(guild_id)
-        if running_task is not None and not running_task.done():
-            return
-
-        rows = self.passive_guild_history_store.read_batch_for_guild(guild_id=guild_id)
-        if not rows:
-            return
-
-        current_memory = self.guild_memory_store.read_for_guild(guild_id)
-        estimated_tokens = self._estimate_passive_guild_prompt_tokens(
-            guild_id=guild_id,
-            guild_name=self._latest_guild_name(guild_id, rows),
-            current_memory=current_memory,
-            rows=rows,
-        )
-        if estimated_tokens < self._passive_guild_flush_threshold_tokens():
-            return
-
-        self._passive_guild_summary_tasks[guild_id] = asyncio.create_task(
-            self._run_passive_guild_summary(guild_id)
-        )
-
-    async def _run_passive_guild_summary(self, guild_id: int, *, force: bool = False) -> dict[str, Any]:
-        try:
-            rows = self.passive_guild_history_store.read_batch_for_guild(guild_id=guild_id)
-            if not rows:
-                return {
-                    "ok": True,
-                    "guild_id": guild_id,
-                    "status": "no_pending_rows",
-                    "messages_processed": 0,
-                }
-
-            guild_name = self._latest_guild_name(guild_id, rows)
-            current_memory = self.guild_memory_store.read_for_guild(guild_id)
-            summarizer_memory = self.guild_memory_store.strip_owner_rules_section(current_memory).strip()
-            if (
-                not force
-                and self._estimate_passive_guild_prompt_tokens(
-                    guild_id=guild_id,
-                    guild_name=guild_name,
-                    current_memory=summarizer_memory,
-                    rows=rows,
-                ) < self._passive_guild_flush_threshold_tokens()
-            ):
-                return {
-                    "ok": True,
-                    "guild_id": guild_id,
-                    "status": "below_threshold",
-                    "messages_processed": 0,
-                }
-
-            selected_rows = self._select_passive_guild_rows_for_flush(
-                guild_id=guild_id,
-                guild_name=guild_name,
-                current_memory=summarizer_memory,
-                rows=rows,
-            )
-            if not selected_rows:
-                return {
-                    "ok": False,
-                    "guild_id": guild_id,
-                    "status": "selection_failed",
-                    "messages_processed": 0,
-                    "error_message": "Passive flush could not select any rows for summarization.",
-                }
-
-            summary_payload = await self._summarize_passive_guild_rows(
-                guild_id=guild_id,
-                guild_name=guild_name,
-                current_memory=summarizer_memory,
-                rows=selected_rows,
-            )
-            rendered_memory = self._render_passive_guild_memory_snapshot(
-                guild_id=guild_id,
-                guild_name=guild_name,
-                summary_payload=summary_payload,
-            )
-            self.guild_memory_store.write_for_guild(
-                guild_id=guild_id,
-                content=rendered_memory,
-            )
-            await self._notify_owner_of_guild_memory_update(
-                guild_id=guild_id,
-                guild_name=guild_name,
-                summary=self._passive_guild_owner_summary(summary_payload),
-            )
-            self.passive_guild_history_store.delete_messages_through_row_id(
-                guild_id=guild_id,
-                max_row_id=int(selected_rows[-1]["row_id"]),
-            )
-            LOGGER.info(
-                "Passive guild memory updated guild_id=%s messages=%s",
-                guild_id,
-                len(selected_rows),
-            )
-            return {
-                "ok": True,
-                "guild_id": guild_id,
-                "status": "updated",
-                "messages_processed": len(selected_rows),
-                "last_processed_row_id": int(selected_rows[-1]["row_id"]),
-            }
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            LOGGER.exception("Passive guild summarization failed guild_id=%s", guild_id)
-            return {
-                "ok": False,
-                "guild_id": guild_id,
-                "status": "failed",
-                "messages_processed": 0,
-                "error_type": type(exc).__name__,
-                "error_message": str(exc),
-            }
-        finally:
-            current_task = self._passive_guild_summary_tasks.get(guild_id)
-            if current_task is asyncio.current_task():
-                self._passive_guild_summary_tasks.pop(guild_id, None)
-
-    async def _flush_passive_guild_memory_now(self, guild_id: int) -> dict[str, Any]:
-        total_processed = 0
-        iterations = 0
-        max_iterations = 50
-
-        while iterations < max_iterations:
-            iterations += 1
-            running_task = self._passive_guild_summary_tasks.get(guild_id)
-            if running_task is not None and not running_task.done():
-                result = await running_task
-            else:
-                result = await self._run_passive_guild_summary(guild_id, force=True)
-
-            processed = int(result.get("messages_processed", 0) or 0)
-            total_processed += processed
-            pending_rows = self.passive_guild_history_store.read_batch_for_guild(guild_id=guild_id)
-
-            if result.get("ok") is False:
-                return {
-                    "ok": False,
-                    "guild_id": guild_id,
-                    "status": "failed",
-                    "iterations": iterations,
-                    "messages_processed": total_processed,
-                    "pending_message_count": len(pending_rows),
-                    "error_type": result.get("error_type"),
-                    "error_message": result.get("error_message", "Passive flush failed."),
-                }
-
-            if not pending_rows:
-                return {
-                    "ok": True,
-                    "guild_id": guild_id,
-                    "status": "flushed",
-                    "iterations": iterations,
-                    "messages_processed": total_processed,
-                    "pending_message_count": 0,
-                }
-
-            if processed <= 0:
-                return {
-                    "ok": False,
-                    "guild_id": guild_id,
-                    "status": "stalled",
-                    "iterations": iterations,
-                    "messages_processed": total_processed,
-                    "pending_message_count": len(pending_rows),
-                    "error_message": "Passive flush made no progress while messages still remained queued.",
-                }
-
-        pending_rows = self.passive_guild_history_store.read_batch_for_guild(guild_id=guild_id)
-        return {
-            "ok": False,
-            "guild_id": guild_id,
-            "status": "iteration_limit",
-            "iterations": iterations,
-            "messages_processed": total_processed,
-            "pending_message_count": len(pending_rows),
-            "error_message": "Passive flush hit iteration limit before draining the queue.",
-        }
-
-    def _pending_passive_guild_message_count(self, guild_id: int) -> int:
-        return len(self.passive_guild_history_store.read_batch_for_guild(guild_id=guild_id))
-
-    def _register_passive_flush_confirmation(
-        self,
-        *,
-        guild_id: int,
-        requester_user_id: int,
-        pending_message_count: int,
-    ) -> None:
-        self._pending_passive_flush_confirmations[(guild_id, requester_user_id)] = PendingPassiveFlushConfirmation(
-            guild_id=guild_id,
-            requester_user_id=requester_user_id,
-            pending_message_count=pending_message_count,
-            expires_at=monotonic() + 300,
-        )
-
-    def _consume_passive_flush_confirmation(
-        self,
-        *,
-        guild_id: int,
-        requester_user_id: int,
-    ) -> PendingPassiveFlushConfirmation | None:
-        key = (guild_id, requester_user_id)
-        confirmation = self._pending_passive_flush_confirmations.get(key)
-        if confirmation is None:
-            return None
-        if monotonic() > confirmation.expires_at:
-            self._pending_passive_flush_confirmations.pop(key, None)
-            return None
-        self._pending_passive_flush_confirmations.pop(key, None)
-        return confirmation
-
-    def _peek_passive_flush_confirmation(
-        self,
-        *,
-        guild_id: int,
-        requester_user_id: int,
-    ) -> PendingPassiveFlushConfirmation | None:
-        key = (guild_id, requester_user_id)
-        confirmation = self._pending_passive_flush_confirmations.get(key)
-        if confirmation is None:
-            return None
-        if monotonic() > confirmation.expires_at:
-            self._pending_passive_flush_confirmations.pop(key, None)
-            return None
-        return confirmation
-
-    def _discard_passive_flush_confirmation(
-        self,
-        *,
-        guild_id: int,
-        requester_user_id: int,
-    ) -> bool:
-        key = (guild_id, requester_user_id)
-        return self._pending_passive_flush_confirmations.pop(key, None) is not None
-
-    def _has_pending_passive_flush_confirmation_for_message(self, message: discord.Message) -> bool:
-        if message.guild is None:
-            return False
-        return (
-            self._peek_passive_flush_confirmation(
-                guild_id=message.guild.id,
-                requester_user_id=message.author.id,
-            )
-            is not None
-        )
-
-    def _passive_flush_confirmation_context_for_message(self, message: discord.Message) -> str:
-        if message.guild is None:
-            return ""
-        confirmation = self._peek_passive_flush_confirmation(
-            guild_id=message.guild.id,
-            requester_user_id=message.author.id,
-        )
-        if confirmation is None:
-            return ""
-        return (
-            "Pending passive server-memory flush confirmation is active.\n"
-            f"- guild_id: {confirmation.guild_id}\n"
-            f"- queued_message_count: {confirmation.pending_message_count}\n"
-            "- If the owner confirms, call flush_passive_server_memory.\n"
-            "- If the owner declines, call cancel_passive_server_memory_flush.\n"
-            "- Do not preview again while this confirmation is active.\n"
-        )
-
-    def _passive_guild_enabled_for_guild(self, guild_id: int) -> bool:
-        passive_config = self.app_config.runtime.passive_guild_memory
-        if not passive_config.enabled:
-            return False
-        if passive_config.enabled_guild_ids is None:
-            return True
-        return guild_id in passive_config.enabled_guild_ids
-
-    def _passive_guild_flush_threshold_tokens(self) -> int:
-        passive_config = self.app_config.runtime.passive_guild_memory
-        return max(1024, int(passive_config.effective_context_limit_tokens * passive_config.flush_ratio))
-
-    def _estimate_passive_guild_prompt_tokens(
-        self,
-        *,
-        guild_id: int,
-        guild_name: str,
-        current_memory: str,
-        rows: list[dict[str, Any]],
-    ) -> int:
-        passive_config = self.app_config.runtime.passive_guild_memory
-        prompt_text = self._passive_guild_summary_prompt_text(
-            guild_id=guild_id,
-            guild_name=guild_name,
-            current_memory=current_memory,
-            rows=rows,
-        )
-        return (len(prompt_text) // 4) + passive_config.max_output_tokens
-
-    def _select_passive_guild_rows_for_flush(
-        self,
-        *,
-        guild_id: int,
-        guild_name: str,
-        current_memory: str,
-        rows: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        passive_config = self.app_config.runtime.passive_guild_memory
-        prompt_budget_tokens = max(
-            1024,
-            self._passive_guild_flush_threshold_tokens() - passive_config.max_output_tokens,
-        )
-        prompt_budget_chars = prompt_budget_tokens * 4
-        base_chars = len(
-            self._passive_guild_summary_prompt_text(
-                guild_id=guild_id,
-                guild_name=guild_name,
-                current_memory=current_memory,
-                rows=[],
-            )
-        )
-
-        selected_rows: list[dict[str, Any]] = []
-        active_channel_id: int | None = None
-        current_chars = base_chars
-        for row in rows:
-            channel_header = ""
-            if row["channel_id"] != active_channel_id:
-                channel_name = row.get("channel_name") or f"channel-{row['channel_id']}"
-                channel_header = f"\n## Channel: {channel_name} ({row['channel_id']})\n"
-
-            row_line = self._passive_guild_row_text(row)
-            projected_chars = current_chars + len(channel_header) + len(row_line)
-            if selected_rows and projected_chars > prompt_budget_chars:
-                break
-
-            selected_rows.append(row)
-            current_chars = projected_chars
-            active_channel_id = int(row["channel_id"])
-
-        if not selected_rows and rows:
-            return [rows[0]]
-        return selected_rows
-
-    async def _summarize_passive_guild_rows(
-        self,
-        *,
-        guild_id: int,
-        guild_name: str,
-        current_memory: str,
-        rows: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        passive_config = self.app_config.runtime.passive_guild_memory
-        models = [passive_config.primary_model]
-        if passive_config.fallback_model and passive_config.fallback_model not in models:
-            models.append(passive_config.fallback_model)
-
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You maintain long-term guild memory for a Discord assistant.\n"
-                    "You receive existing guild memory plus a chronological batch of new messages.\n"
-                    "Revise memory carefully: preserve useful old facts, remove stale claims, merge duplicates, and add new useful observations.\n"
-                    "Capture guild-level norms, channel habits, recurring topics, jokes, relationships, interaction styles, and lightweight observable member traits.\n"
-                    "Allowed member traits are only observable behavior such as talkative, kind, likes certain topics, often helps, often jokes, recurring habits, preferred level of detail, or recognizable communication style.\n"
-                    "Prefer small reusable cues that would help future replies land better, not just major facts.\n"
-                    "Do not infer sensitive traits or hidden attributes.\n"
-                    "Return strict JSON only with keys guild_notes, channel_notes, member_notes.\n"
-                    "Each key must map to a list.\n"
-                    "channel_notes items must contain channel_id, channel_name, notes.\n"
-                    "member_notes items must contain user_id, username, notes."
-                ),
-            },
-            {
-                "role": "user",
-                "content": self._passive_guild_summary_prompt_text(
-                    guild_id=guild_id,
-                    guild_name=guild_name,
-                    current_memory=current_memory,
-                    rows=rows,
-                ),
-            },
-        ]
-
-        last_error: Exception | None = None
-        for model in models:
-            try:
-                response = await self.openrouter_chat(
-                    model=model,
-                    messages=messages,
-                    extra_payload={
-                        "temperature": passive_config.temperature,
-                        "max_tokens": passive_config.max_output_tokens,
-                    },
-                    max_attempts=1,
-                )
-                text = self.extract_response_text(response, messages=messages)
-                return self._parse_passive_guild_summary_json(text)
-            except Exception as exc:
-                last_error = exc
-                LOGGER.warning(
-                    "Passive guild summarizer failed model=%s guild_id=%s error=%s",
-                    model,
-                    guild_id,
-                    exc,
-                )
-
-        if last_error is not None:
-            raise last_error
-        raise RuntimeError("Passive guild summarizer failed without a captured exception.")
-
-    def _passive_guild_summary_prompt_text(
-        self,
-        *,
-        guild_id: int,
-        guild_name: str,
-        current_memory: str,
-        rows: list[dict[str, Any]],
-    ) -> str:
-        memory_text = current_memory.strip() or "(none)"
-        messages_text = self._serialize_passive_guild_rows(rows).strip() or "(no messages)"
-        return (
-            f"Guild ID: {guild_id}\n"
-            f"Guild name: {guild_name}\n\n"
-            "Current guild memory:\n"
-            f"{memory_text}\n\n"
-            "New raw guild messages, grouped by channel:\n"
-            f"{messages_text}\n"
-        )
-
-    def _serialize_passive_guild_rows(self, rows: list[dict[str, Any]]) -> str:
-        if not rows:
-            return ""
-
-        lines: list[str] = []
-        active_channel_id: int | None = None
-        for row in rows:
-            channel_id = int(row["channel_id"])
-            if channel_id != active_channel_id:
-                channel_name = row.get("channel_name") or f"channel-{channel_id}"
-                lines.append(f"## Channel: {channel_name} ({channel_id})")
-                active_channel_id = channel_id
-            lines.append(self._passive_guild_row_text(row).rstrip())
-        return "\n".join(lines)
-
-    @staticmethod
-    def _passive_guild_row_text(row: dict[str, Any]) -> str:
-        created_at = row.get("created_at") or "unknown-time"
-        author_username = row.get("author_username") or "unknown-user"
-        author_id = row.get("author_id")
-        content = row.get("content") or ""
-        return f"- [{created_at}] {author_username} ({author_id}): {content}\n"
-
-    def _parse_passive_guild_summary_json(self, text: str) -> dict[str, Any]:
-        candidate_texts = [text.strip()]
-        stripped = text.strip()
-        if stripped.startswith("```"):
-            stripped = stripped.strip("`")
-            if stripped.startswith("json"):
-                stripped = stripped[4:].lstrip()
-            candidate_texts.append(stripped)
-        first_brace = text.find("{")
-        last_brace = text.rfind("}")
-        if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
-            candidate_texts.append(text[first_brace : last_brace + 1].strip())
-
-        parsed: dict[str, Any] | None = None
-        for candidate in candidate_texts:
-            if not candidate:
-                continue
-            try:
-                value = json.loads(candidate)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict):
-                parsed = value
-                break
-
-        if parsed is None:
-            raise ValueError("Passive guild summarizer did not return valid JSON.")
-
-        guild_notes = parsed.get("guild_notes")
-        channel_notes = parsed.get("channel_notes")
-        member_notes = parsed.get("member_notes")
-        if not isinstance(guild_notes, list) or not isinstance(channel_notes, list) or not isinstance(member_notes, list):
-            raise ValueError("Passive guild summary JSON is missing required list keys.")
-
-        return {
-            "guild_notes": self._normalize_passive_summary_notes(guild_notes),
-            "channel_notes": [
-                {
-                    "channel_id": int(item.get("channel_id")),
-                    "channel_name": str(item.get("channel_name", "")).strip() or f"channel-{item.get('channel_id')}",
-                    "notes": self._normalize_passive_summary_notes(item.get("notes", [])),
-                }
-                for item in channel_notes
-                if isinstance(item, dict) and item.get("channel_id") is not None
-            ],
-            "member_notes": [
-                {
-                    "user_id": int(item.get("user_id")),
-                    "username": str(item.get("username", "")).strip() or f"user-{item.get('user_id')}",
-                    "notes": self._normalize_passive_summary_notes(item.get("notes", [])),
-                }
-                for item in member_notes
-                if isinstance(item, dict) and item.get("user_id") is not None
-            ],
-        }
-
-    @staticmethod
-    def _normalize_passive_summary_notes(raw_notes: Any) -> list[str]:
-        if isinstance(raw_notes, str):
-            note = raw_notes.strip()
-            return [note] if note else []
-        if not isinstance(raw_notes, list):
-            return []
-        return [str(item).strip() for item in raw_notes if str(item).strip()]
-
-    def _render_passive_guild_memory_snapshot(
-        self,
-        *,
-        guild_id: int,
-        guild_name: str,
-        summary_payload: dict[str, Any],
-    ) -> str:
-        lines = [
-            f"# Server Memory: {guild_id}",
-            "",
-            f"- Guild ID: {guild_id}",
-            f"- Last known guild name: {guild_name}",
-            "",
-            "## Guild Notes",
-        ]
-
-        guild_notes = summary_payload.get("guild_notes", [])
-        if guild_notes:
-            for note in guild_notes:
-                lines.append(f"- {note}")
-        else:
-            lines.append("- (none)")
-
-        lines.extend(["", "## Channel Notes"])
-        channel_notes = summary_payload.get("channel_notes", [])
-        if channel_notes:
-            for item in channel_notes:
-                lines.append(f"### {item['channel_name']} ({item['channel_id']})")
-                if item["notes"]:
-                    for note in item["notes"]:
-                        lines.append(f"- {note}")
-                else:
-                    lines.append("- (none)")
-        else:
-            lines.append("- (none)")
-
-        lines.extend(["", "## Member Notes"])
-        member_notes = summary_payload.get("member_notes", [])
-        if member_notes:
-            for item in member_notes:
-                lines.append(f"### {item['username']} ({item['user_id']})")
-                if item["notes"]:
-                    for note in item["notes"]:
-                        lines.append(f"- {note}")
-                else:
-                    lines.append("- (none)")
-        else:
-            lines.append("- (none)")
-
-        return "\n".join(lines)
-
-    def _passive_guild_owner_summary(self, summary_payload: dict[str, Any]) -> str:
-        lines: list[str] = []
-
-        guild_notes = summary_payload.get("guild_notes", [])
-        if guild_notes:
-            lines.append("Guild notes:")
-            for note in guild_notes[:3]:
-                lines.append(f"- {note}")
-
-        channel_notes = summary_payload.get("channel_notes", [])
-        if channel_notes:
-            lines.append("Channel notes:")
-            for item in channel_notes[:2]:
-                channel_name = item.get("channel_name") or item.get("channel_id")
-                note_list = item.get("notes", [])
-                if note_list:
-                    lines.append(f"- {channel_name}: {note_list[0]}")
-
-        member_notes = summary_payload.get("member_notes", [])
-        if member_notes:
-            lines.append("Member notes:")
-            for item in member_notes[:3]:
-                username = item.get("username") or item.get("user_id")
-                note_list = item.get("notes", [])
-                if note_list:
-                    lines.append(f"- {username}: {note_list[0]}")
-
-        if not lines:
-            return "Memory snapshot updated, but there were no non-empty summary notes."
-        return "\n".join(lines)
-
-    def _latest_guild_name(self, guild_id: int, rows: list[dict[str, Any]]) -> str:
-        guild = self.get_guild(guild_id)
-        if guild is not None and getattr(guild, "name", None):
-            return guild.name
-        for row in reversed(rows):
-            guild_name = str(row.get("guild_name") or "").strip()
-            if guild_name:
-                return guild_name
-        return "unknown"
-
     def _store_passive_guild_message(self, message: discord.Message) -> None:
         if message.guild is None:
             return
-        if not self._passive_guild_enabled_for_guild(message.guild.id):
+        if not self.passive_summarizer.is_enabled_for_guild(message.guild.id):
             return
 
-        content = self._passive_guild_content_for_message(message)
+        content = self._message_text_for_context(message)
         if not content:
             return
 
-        self.passive_guild_history_store.append_message(
+        self.passive_summarizer.store_passive_guild_message(
             guild_id=message.guild.id,
             guild_name=message.guild.name,
             channel_id=message.channel.id,
@@ -928,13 +443,15 @@ class DiscoAssistant(discord.Client):
             discord_message_id=message.id,
             created_at=message.created_at.isoformat() if message.created_at else None,
         )
-        running_task = self._passive_guild_summary_tasks.get(message.guild.id)
+        running_task = self.passive_summarizer.summary_tasks.get(message.guild.id)
         if running_task is None or running_task.done():
-            asyncio.create_task(self._maybe_start_passive_guild_summary_for_guild(message.guild.id))
+            asyncio.create_task(self.passive_summarizer.maybe_start_summary_for_guild(message.guild.id))
 
-    @staticmethod
-    def _passive_guild_content_for_message(message: discord.Message) -> str:
-        return DiscoAssistant._message_text_for_context(message)
+    def _guild_name_for_id(self, guild_id: int) -> str | None:
+        guild = self.get_guild(guild_id)
+        if guild is not None and getattr(guild, "name", None):
+            return guild.name
+        return None
 
     @staticmethod
     def _message_text_for_context(message: discord.Message) -> str:
@@ -1021,117 +538,13 @@ class DiscoAssistant(discord.Client):
         self._queue_reply_attempt(message)
 
     async def close(self) -> None:
-        for task in self._reply_tasks.values():
-            if not task.done():
-                task.cancel()
-        for task in self._passive_guild_summary_tasks.values():
-            if not task.done():
-                task.cancel()
-        if self._passive_guild_poller_task is not None and not self._passive_guild_poller_task.done():
-            self._passive_guild_poller_task.cancel()
+        self.in_flight.cancel_all()
+        self.typing_registry.cancel_all()
+        self.passive_poller.close()
         if self._presence_update_task is not None and not self._presence_update_task.done():
             self._presence_update_task.cancel()
-        if self.http_session is not None and not self.http_session.closed:
-            await self.http_session.close()
+        await self.openrouter.close()
         await super().close()
-
-    async def openrouter_chat(
-        self,
-        *,
-        model: str | None = None,
-        messages: list[dict[str, str]],
-        extra_payload: dict[str, Any] | None = None,
-        max_attempts: int = 4,
-    ) -> dict[str, Any]:
-        if self.http_session is None:
-            raise RuntimeError("HTTP session has not been created yet.")
-
-        payload: dict[str, Any] = {
-            "model": model or self.app_config.runtime.openrouter.default_model,
-            "messages": messages,
-        }
-        if extra_payload:
-            payload.update(extra_payload)
-
-        max_attempts = max(1, int(max_attempts))
-        last_error: Exception | None = None
-        selected_model = model or self.app_config.runtime.openrouter.default_model
-        for attempt in range(1, max_attempts + 1):
-            request_started_at = monotonic()
-            try:
-                LOGGER.info(
-                    "OpenRouter request start model=%s attempt=%s messages=%s tools=%s",
-                    selected_model,
-                    attempt,
-                    len(messages),
-                    "tools" in payload,
-                )
-                async with self.http_session.post(
-                    f"{self.app_config.runtime.openrouter.base_url}/chat/completions",
-                    json=payload,
-                ) as response:
-                    response.raise_for_status()
-                    response_payload = await response.json()
-                    self._record_token_usage(response_payload)
-                    LOGGER.info(
-                        "OpenRouter request success model=%s attempt=%s duration=%.2fs",
-                        selected_model,
-                        attempt,
-                        monotonic() - request_started_at,
-                    )
-                    return response_payload
-            except aiohttp.ClientResponseError as exc:
-                last_error = exc
-                should_retry = exc.status in {429, 500, 502, 503, 504} and attempt < max_attempts
-                if not should_retry:
-                    LOGGER.error(
-                        "OpenRouter request failed model=%s attempt=%s duration=%.2fs status=%s error=%s",
-                        selected_model,
-                        attempt,
-                        monotonic() - request_started_at,
-                        exc.status,
-                        exc,
-                    )
-                    raise
-
-                retry_after = self._retry_after_seconds(exc.headers)
-                delay = retry_after if retry_after is not None else min(8.0, 1.5 * (2 ** (attempt - 1)))
-                LOGGER.warning(
-                    "OpenRouter request failed model=%s status=%s attempt=%s/%s duration=%.2fs retry_in=%.2fs",
-                    selected_model,
-                    exc.status,
-                    attempt,
-                    max_attempts,
-                    monotonic() - request_started_at,
-                    delay,
-                )
-                await asyncio.sleep(delay)
-            except aiohttp.ClientError as exc:
-                last_error = exc
-                if attempt >= max_attempts:
-                    LOGGER.error(
-                        "OpenRouter network error model=%s attempt=%s duration=%.2fs error=%s",
-                        selected_model,
-                        attempt,
-                        monotonic() - request_started_at,
-                        exc,
-                    )
-                    raise
-                delay = min(8.0, 1.0 * (2 ** (attempt - 1)))
-                LOGGER.warning(
-                    "OpenRouter network error model=%s attempt=%s/%s duration=%.2fs retry_in=%.2fs error=%s",
-                    selected_model,
-                    attempt,
-                    max_attempts,
-                    monotonic() - request_started_at,
-                    delay,
-                    exc,
-                )
-                await asyncio.sleep(delay)
-
-        if last_error is not None:
-            raise last_error
-        raise RuntimeError("OpenRouter request failed without a captured exception.")
 
     def _should_respond_to_message(self, message: discord.Message) -> bool:
         if not self._should_consider_message(message):
@@ -1144,7 +557,7 @@ class DiscoAssistant(discord.Client):
         if self.user is None:
             return False
 
-        if message.id in self._recent_response_ids:
+        if message.id in self.response_dedup:
             return False
 
         if message.author.id == self.user.id:
@@ -1166,127 +579,50 @@ class DiscoAssistant(discord.Client):
     ) -> str:
         LOGGER.info("generate_reply_for_message start id=%s", message.id)
         selected_agent = self._agent_for_message(message)
-        owner_context_prompt = await self._owner_context_prompt(message)
-        prompt_parts = [
-            self.app_config.runtime.prompts.get("shared_base", ""),
-            self.app_config.runtime.prompts.get("response_style", ""),
-            self.app_config.runtime.prompts.get("tool_rules", ""),
-            self.app_config.runtime.prompts.get("memory_rules", ""),
-            self.app_config.runtime.prompts.get("safety", ""),
-            self._assistant_identity_prompt(),
-            owner_context_prompt,
-            self._owner_only_tools_prompt(selected_agent.name),
-            selected_agent.system_prompt,
-        ]
-        system_prompt = "\n\n".join(part for part in prompt_parts if part)
-        conversation = None if self._is_direct_message(message) else self._get_active_conversation(message)
-        mention_only = self._is_mention_without_other_text(message)
-        prefetched_channel_context = ""
-        if mention_only or self._should_prefetch_channel_context(message):
-            prefetched_channel_context = await self._prefetch_channel_history_for_message(message)
-        memory_context = self._user_memory_context_for_message(message)
-        server_memory_context = self._server_memory_context_for_message(message)
-        pending_burst_context = self._pending_burst_context(pending_messages, latest_message_id=message.id)
-        reply_reference_context = await self._reply_reference_context(message)
-        passive_flush_confirmation_context = self._passive_flush_confirmation_context_for_message(message)
+        is_dm = self._is_direct_message(message)
+        conversation = None if is_dm else self._get_active_conversation(message)
+        built = await self.prompt_builder.build(
+            message=message,
+            pending_messages=pending_messages,
+        )
+        messages = built.messages
+        user_message = built.user_message
+        extra_payload = built.extra_payload
 
-        messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
-        if self._is_direct_message(message):
-            messages.extend(self._dm_conversation_context_for_message(message))
-        elif conversation is not None:
-            messages.extend(conversation.messages)
-
-        if self._is_direct_message(message):
-            user_message = None
-            messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "Direct-message mode.\n"
-                        f"Owner user id: {self.app_config.settings.owner_user_id}\n"
-                        f"Author username: {message.author}\n"
-                        f"Author display name: {self._display_name_for_message_author(message)}\n"
-                        "Full DM chat history above is authoritative context. "
-                        "Latest user message is already included there. "
-                        "Use only user memory, not server memory. "
-                        "When using send_message, never guess recipient. "
-                        "Never say a message was sent unless tool result explicitly says ok true. "
-                        "If a tool call fails, keep working and retry when possible. "
-                        "Keep reply short."
-                        f"\n{reply_reference_context}"
-                        f"\n{memory_context}"
-                    ),
-                }
-            )
-        else:
-            user_message = {
-                "role": "user",
-                "content": (
-                    "Respond to this Discord message naturally as the logged-in account.\n"
-                    f"Conversation mode: {'follow-up' if conversation is not None else 'new mention'}\n"
-                    f"Mention-only message: {'yes' if mention_only else 'no'}\n"
-                    f"Owner user id: {self.app_config.settings.owner_user_id}\n"
-                    f"Author username: {message.author}\n"
-                    f"Author display name: {self._display_name_for_message_author(message)}\n"
-                    f"{self._mentioned_users_context(message)}"
-                    f"{self._mentioned_channels_context(message)}"
-                    f"{reply_reference_context}"
-                    f"Channel message: {self._message_text_for_context(message) or '(no text)'}\n"
-                    "If this is a mention-only message, do not send a generic greeting. Use recent channel history to infer what the user is asking and answer that directly.\n"
-                    "When using send_message, never guess recipient. Use an explicit mentioned user id or the owner user id. If target is unclear, say so instead of sending.\n"
-                    "Never say a message was sent unless the tool result explicitly says ok true.\n"
-                    "If a tool call fails, keep working. Retry with corrected tool calls and do not answer user until tool work succeeds or is impossible after repeated retries.\n"
-                    "Always answer the latest user message, not an older one. If the latest message contains multiple questions, requests, or lines, address all of them in your reply.\n"
-                    f"{pending_burst_context}"
-                    f"{memory_context}"
-                    f"{server_memory_context}"
-                    f"{passive_flush_confirmation_context}"
-                    f"{prefetched_channel_context}"
-                    "Keep it short."
-                ),
-            }
-            messages.append(user_message)
-
-        extra_payload: dict[str, Any] = {
-            "temperature": selected_agent.temperature,
-            "max_tokens": selected_agent.max_output_tokens,
-        }
-        tools = self._tool_schemas_for_agent(selected_agent.tools)
-        if tools:
-            extra_payload["tools"] = tools
-            extra_payload["tool_choice"] = self._tool_choice_for_message(message)
-
-        response = await self._run_chat_with_tools_if_needed(
+        response = await self.tool_loop.run(
             model=selected_agent.model,
             messages=messages,
             extra_payload=extra_payload,
-            tool_context={
-                "message": message,
-            },
+            tool_context=ToolContext(message=message, services=self),
         )
-        reply_text = self.extract_response_text(response, messages=messages)
+        reply_text = extract_response_text(response, messages=messages)
         if reply_text == "I couldn't produce a normal reply, but I can try again.":
-            recovery_messages = [
-                *messages,
-                {
-                    "role": "user",
-                    "content": (
-                        "Answer the user's actual question directly now in one short reply. "
-                        "Do not narrate tool usage, do not ask what they want if the context already contains it, "
-                        "and use fetched history silently if it is relevant."
-                    ),
-                },
-            ]
-            recovery_response = await self.openrouter_chat(
-                model=selected_agent.model,
-                messages=recovery_messages,
-                extra_payload={
-                    "temperature": selected_agent.temperature,
-                    "max_tokens": selected_agent.max_output_tokens,
-                },
-            )
-            reply_text = self.extract_response_text(recovery_response, messages=recovery_messages)
-        await self._maybe_capture_owner_memory(
+            deterministic = synthesize_deterministic_reply(messages)
+            if deterministic is not None:
+                reply_text = deterministic
+            elif len(messages) < 10:
+                recovery_messages = [
+                    *messages,
+                    {
+                        "role": "user",
+                        "content": (
+                            "Answer the user's actual question directly now in one short reply. "
+                            "Do not narrate tool usage; use fetched context silently if relevant."
+                        ),
+                    },
+                ]
+                recovery_response = await self.openrouter.chat(
+                    model=selected_agent.model,
+                    messages=recovery_messages,
+                    extra_payload={
+                        "temperature": selected_agent.temperature,
+                        "max_tokens": selected_agent.max_output_tokens,
+                    },
+                )
+                reply_text = extract_response_text(recovery_response, messages=recovery_messages)
+            else:
+                reply_text = "Got it — give me a moment, then ask again if I haven't followed up."
+        await self.owner_memory_capturer.maybe_capture(
             message=message,
             reply_text=reply_text,
             pending_messages=pending_messages,
@@ -1302,58 +638,32 @@ class DiscoAssistant(discord.Client):
         return reply_text
 
     def _queue_reply_attempt(self, message: discord.Message) -> None:
-        key = self._conversation_key(message)
-        now = monotonic()
-        pending = self._pending_replies.get(key)
         is_direct_mention = self._should_respond_to_message(message)
         has_active_conversation = self._has_active_conversation(message)
-        if pending is None:
-            first_seen_at = now
-            started_from_mention = is_direct_mention
-            started_from_active_conversation = has_active_conversation
-            pending_messages = [message]
-        else:
-            first_seen_at = pending.first_seen_at
-            started_from_mention = pending.started_from_mention or is_direct_mention
-            started_from_active_conversation = (
-                pending.started_from_active_conversation or has_active_conversation
-            )
-            pending_messages = [*pending.messages, message][-8:]
-
-        self._pending_replies[key] = PendingReply(
-            message=message,
-            updated_at=now,
-            first_seen_at=first_seen_at,
-            started_from_mention=started_from_mention,
-            started_from_active_conversation=started_from_active_conversation,
-            messages=pending_messages,
-        )
-        LOGGER.info(
-            "pending reply updated key=%s message_id=%s updated_at=%.3f first_seen_at=%.3f started_from_mention=%s started_from_active=%s buffered=%s",
-            key,
-            message.id,
-            now,
-            first_seen_at,
-            started_from_mention,
-            started_from_active_conversation,
-            len(pending_messages),
+        key, _ = self.pending.upsert(
+            message,
+            is_direct_mention=is_direct_mention,
+            has_active_conversation=has_active_conversation,
+            now=monotonic(),
         )
 
-        existing_task = self._reply_tasks.get(key)
+        self.typing_registry.ensure_running(key, message.channel)
+
+        existing_task = self.in_flight.get(key)
         if existing_task is not None and not existing_task.done():
-            if key in self._reply_generation_in_progress:
+            if self.in_flight.is_generating(key):
                 LOGGER.info("cancel in-flight generation key=%s for newer message_id=%s", key, message.id)
                 existing_task.cancel()
-                self._reply_tasks[key] = asyncio.create_task(self._process_pending_reply(key))
+                self.in_flight.set(key, asyncio.create_task(self._process_pending_reply(key)))
                 LOGGER.info("spawned replacement reply task key=%s", key)
             else:
                 LOGGER.info("reuse existing debounce task key=%s latest_message_id=%s", key, message.id)
             return
 
-        self._reply_tasks[key] = asyncio.create_task(self._process_pending_reply(key))
+        self.in_flight.set(key, asyncio.create_task(self._process_pending_reply(key)))
         LOGGER.info("spawned new reply task key=%s message_id=%s", key, message.id)
 
-    async def _process_pending_reply(self, key: tuple[int, int]) -> None:
+    async def _process_pending_reply(self, key: ConversationKey) -> None:
         try:
             LOGGER.info("reply task start key=%s", key)
             message = await self._wait_until_user_idle(key)
@@ -1362,11 +672,11 @@ class DiscoAssistant(discord.Client):
                 return
 
             LOGGER.info("debounce finished key=%s message_id=%s", key, message.id)
-            pending = self._pending_replies.get(key)
+            pending = self.pending.get(key)
             pending_messages = pending.messages if pending is not None else [message]
             should_respond = self._should_respond_to_message(message)
             had_active_conversation = self._has_active_conversation(message)
-            if not should_respond and self._has_pending_passive_flush_confirmation_for_message(message):
+            if not should_respond and self.flush_confirmations.has_pending_for_message(message):
                 LOGGER.info(
                     "reply task treating message_id=%s as passive flush confirmation follow-up",
                     message.id,
@@ -1402,11 +712,10 @@ class DiscoAssistant(discord.Client):
                 LOGGER.info("reply task exit key=%s message_id=%s reason=should_not_respond", key, message.id)
                 return
 
-            self._reply_generation_in_progress.add(key)
-            self._recent_response_ids.append(message.id)
+            self.in_flight.mark_generating(key)
+            self.response_dedup.add(message.id)
             LOGGER.info("start generation key=%s message_id=%s", key, message.id)
-            async with message.channel.typing():
-                reply_text = await self.generate_reply_for_message(message, pending_messages)
+            reply_text = await self.generate_reply_for_message(message, pending_messages)
             LOGGER.info("generation done key=%s message_id=%s reply=%r", key, message.id, reply_text)
             if not reply_text.strip():
                 LOGGER.info("reply suppressed key=%s message_id=%s", key, message.id)
@@ -1418,51 +727,26 @@ class DiscoAssistant(discord.Client):
             LOGGER.info("reply task cancelled key=%s", key)
             raise
         except Exception as exc:
-            pending = self._pending_replies.get(key)
+            pending = self.pending.get(key)
             message = pending.message if pending is not None else None
             if message is not None:
                 LOGGER.exception("Failed to generate or send reply for message %s", message.id)
-                await self._send_channel_reply(message, self._safe_runtime_error_reply(exc))
+                await self._send_channel_reply(message, safe_runtime_error_reply(exc))
             else:
                 LOGGER.exception("Failed to generate or send reply for conversation %s", key)
         finally:
             current_task = asyncio.current_task()
-            self._reply_generation_in_progress.discard(key)
-            if self._reply_tasks.get(key) is current_task:
-                self._reply_tasks.pop(key, None)
-                self._pending_replies.pop(key, None)
+            self.in_flight.clear_generating(key)
+            if self.in_flight.cleanup_if_owner(key, current_task):
+                self.pending.pop(key)
+                self.debouncer.discard(key)
+                self.typing_registry.stop(key)
                 LOGGER.info("reply task cleanup key=%s removed_task=yes", key)
             else:
                 LOGGER.info("reply task cleanup key=%s removed_task=no", key)
 
-    async def _wait_until_user_idle(self, key: tuple[int, int]) -> discord.Message | None:
-        config = self.app_config.runtime.discord
-
-        while True:
-            pending = self._pending_replies.get(key)
-            if pending is None:
-                return None
-
-            now = monotonic()
-            debounce_ready_at = pending.updated_at + config.reply_debounce_seconds
-            if now >= debounce_ready_at:
-                LOGGER.info(
-                    "debounce ready key=%s message_id=%s now=%.3f ready_at=%.3f",
-                    key,
-                    pending.message.id,
-                    now,
-                    debounce_ready_at,
-                )
-                return pending.message
-
-            sleep_for = max(0.05, debounce_ready_at - now)
-            LOGGER.info(
-                "debounce wait key=%s current_message_id=%s sleep=%.3f",
-                key,
-                pending.message.id,
-                sleep_for,
-            )
-            await asyncio.sleep(sleep_for)
+    async def _wait_until_user_idle(self, key: ConversationKey) -> discord.Message | None:
+        return await self.debouncer.wait_until_idle(key)
 
     async def _send_channel_reply(self, message: discord.Message, content: str) -> discord.Message:
         try:
@@ -1496,380 +780,6 @@ class DiscoAssistant(discord.Client):
             return resolved.author.id == self.user.id
         return False
 
-    async def _run_chat_with_tools_if_needed(
-        self,
-        *,
-        model: str | None,
-        messages: list[dict[str, Any]],
-        extra_payload: dict[str, Any],
-        tool_context: dict[str, Any],
-    ) -> dict[str, Any]:
-        current_payload = dict(extra_payload)
-        response = await self.openrouter_chat(
-            model=model,
-            messages=messages,
-            extra_payload=current_payload,
-        )
-        max_calls = self.app_config.runtime.tool_policy.max_calls_per_turn
-        tool_calls_used = 0
-        unresolved_tool_failure: dict[str, Any] | None = None
-
-        while tool_calls_used < max_calls:
-            assistant_message = response.get("choices", [{}])[0].get("message", {})
-            tool_calls = assistant_message.get("tool_calls", [])
-            if not tool_calls:
-                if unresolved_tool_failure is not None:
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "Previous tool call failed.\n"
-                                f"Tool: {unresolved_tool_failure['name']}\n"
-                                f"Error: {unresolved_tool_failure['error_message']}\n"
-                                "Do not answer user yet. Retry with corrected tool call. "
-                                "Only send final reply after tool succeeds."
-                            ),
-                        }
-                    )
-                    current_payload["tool_choice"] = "required"
-                    response = await self.openrouter_chat(
-                        model=model,
-                        messages=messages,
-                        extra_payload=current_payload,
-                    )
-                    continue
-                return response
-
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": assistant_message.get("content") or "",
-                    "tool_calls": tool_calls,
-                }
-            )
-
-            current_payload["tool_choice"] = "auto"
-            for tool_call in tool_calls:
-                tool_calls_used += 1
-                try:
-                    tool_result = await self._execute_tool_call(tool_call, tool_context)
-                except Exception as exc:
-                    LOGGER.exception(
-                        "Tool call failed name=%s id=%s",
-                        tool_call.get("function", {}).get("name", ""),
-                        tool_call.get("id", ""),
-                    )
-                    tool_result = {
-                        "ok": False,
-                        "error_type": type(exc).__name__,
-                        "error_message": str(exc),
-                    }
-                if tool_result.get("ok") is False:
-                    unresolved_tool_failure = {
-                        "name": tool_call["function"]["name"],
-                        "error_message": str(tool_result.get("error_message", "Tool failed.")),
-                    }
-                elif (
-                    unresolved_tool_failure is not None
-                    and unresolved_tool_failure["name"] == tool_call["function"]["name"]
-                ):
-                    unresolved_tool_failure = None
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call["id"],
-                        "name": tool_call["function"]["name"],
-                        "content": json.dumps(tool_result),
-                    }
-                )
-                if tool_calls_used >= max_calls:
-                    break
-
-            response = await self.openrouter_chat(
-                model=model,
-                messages=messages,
-                extra_payload=current_payload,
-            )
-
-        if unresolved_tool_failure is not None:
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": (
-                                "Couldn't complete tool action after repeated retries: "
-                                f"{unresolved_tool_failure['error_message']}"
-                            )
-                        }
-                    }
-                ]
-            }
-
-        current_payload["tool_choice"] = "none"
-        return await self.openrouter_chat(
-            model=model,
-            messages=messages,
-            extra_payload=current_payload,
-        )
-
-    async def _maybe_capture_owner_memory(
-        self,
-        *,
-        message: discord.Message,
-        reply_text: str,
-        pending_messages: list[discord.Message] | None = None,
-    ) -> None:
-        if not self.app_config.runtime.memory.enabled:
-            return
-        if message.author.id != self.app_config.settings.owner_user_id:
-            return
-
-        latest_text = self._message_text_for_context(message).strip()
-        if not latest_text:
-            return
-        if self._is_mention_without_other_text(message):
-            return
-
-        transcript = self._memory_capture_transcript(
-            message=message,
-            pending_messages=pending_messages,
-        )
-        memory_context = self.user_memory_store.read_for_prompt(message.author.id)
-        server_memory_context = self._server_memory_context_for_message(message)
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You extract durable memory from the owner's latest Discord messages.\n"
-                    "Return strict JSON only.\n"
-                    "Decide whether any reusable long-term note should be saved.\n"
-                    "Use user memory only for important personal facts about the owner: identity facts, durable relationships, long-term projects, stable preferences, important plans, or other biographical facts likely to matter across servers.\n"
-                    "Do not put casual style cues, small interaction habits, lightweight collaboration preferences, or routine chat details into user memory.\n"
-                    "Save those casual or local details to server memory instead when they are useful in this guild.\n"
-                    "Save server-wide rules, shared norms, channel habits, shared in-jokes, guild-specific behavior instructions, and most casual reusable context to server memory.\n"
-                    "If the owner is speaking in a guild channel and tells the assistant how to behave toward a member, role, topic, or conversation in that server, store that in server memory, not user memory.\n"
-                    "Examples that belong in server memory: 'remember to be colder to X here', 'don't joke about Y in this server', 'call Joey by that nickname here'.\n"
-                    "Do not save one-off chatter, transient tasks, or details already present in memory.\n"
-                    "Do not duplicate a note into both user and server memory.\n"
-                    "JSON schema:\n"
-                    "{\"user_memory_append\": [string], \"server_memory_append\": [string]}"
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Owner user id: {self.app_config.settings.owner_user_id}\n"
-                    f"Channel type: {'dm' if self._is_direct_message(message) else 'guild'}\n"
-                    f"Assistant reply: {reply_text or '(none)'}\n"
-                    f"{memory_context}"
-                    f"{server_memory_context}"
-                    "Latest owner message batch:\n"
-                    f"{transcript}\n"
-                    "Return JSON only."
-                ),
-            },
-        ]
-
-        try:
-            response = await self.openrouter_chat(
-                model=self.app_config.runtime.agents["owner"].model,
-                messages=messages,
-                extra_payload={
-                    "temperature": 0,
-                    "max_tokens": 250,
-                },
-            )
-            payload = self._parse_memory_capture_payload(self.extract_response_text(response, messages=messages))
-        except Exception:
-            LOGGER.exception("Owner memory capture failed for message_id=%s", message.id)
-            return
-
-        user_notes = self._dedupe_memory_notes(
-            payload.get("user_memory_append"),
-            existing_memory=self.user_memory_store.read_for_user(message.author.id),
-        )
-        server_notes: list[str] = []
-        if message.guild is not None:
-            server_notes = self._dedupe_memory_notes(
-                payload.get("server_memory_append"),
-                existing_memory=self.guild_memory_store.read_for_guild(message.guild.id),
-            )
-            rerouted_user_notes: list[str] = []
-            kept_user_notes: list[str] = []
-            for note in user_notes:
-                if self._should_route_owner_note_to_server(message=message, note=note) or not self._is_important_user_fact(note):
-                    rerouted_user_notes.append(note)
-                else:
-                    kept_user_notes.append(note)
-            user_notes = kept_user_notes
-            if rerouted_user_notes:
-                server_existing = self.guild_memory_store.read_for_guild(message.guild.id)
-                server_notes = self._dedupe_memory_notes(
-                    [*server_notes, *rerouted_user_notes],
-                    existing_memory=server_existing,
-                )
-
-        for note in user_notes:
-            path = self.user_memory_store.append_for_user(
-                user_id=message.author.id,
-                note=note,
-                author_display_name=self._display_name_for_message_author(message),
-                source_channel_id=getattr(message.channel, "id", None),
-            )
-            LOGGER.info("Owner memory captured user_id=%s path=%s note=%r", message.author.id, path, note)
-
-        for note in server_notes:
-            path = self.guild_memory_store.append_for_guild(
-                guild_id=message.guild.id,
-                note=note,
-                guild_name=message.guild.name,
-                author_display_name=self._display_name_for_message_author(message),
-                source_channel_id=getattr(message.channel, "id", None),
-                owner_priority=True,
-            )
-            LOGGER.info("Owner server memory captured guild_id=%s path=%s note=%r", message.guild.id, path, note)
-
-    def _memory_capture_transcript(
-        self,
-        *,
-        message: discord.Message,
-        pending_messages: list[discord.Message] | None = None,
-    ) -> str:
-        relevant_messages = pending_messages or [message]
-        lines: list[str] = []
-        for item in relevant_messages[-8:]:
-            author_name = self._display_name_for_message_author(item)
-            content = self._message_text_for_context(item).strip() or "(no text)"
-            lines.append(f"{author_name}: {content}")
-        return "\n".join(lines)
-
-    @staticmethod
-    def _parse_memory_capture_payload(raw_text: str) -> dict[str, list[str]]:
-        text = raw_text.strip()
-        if not text:
-            return {"user_memory_append": [], "server_memory_append": []}
-
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end >= start:
-            text = text[start : end + 1]
-
-        payload = json.loads(text)
-        if not isinstance(payload, dict):
-            raise ValueError("Memory capture payload must be a JSON object.")
-
-        return {
-            "user_memory_append": payload.get("user_memory_append", []),
-            "server_memory_append": payload.get("server_memory_append", []),
-        }
-
-    def _dedupe_memory_notes(self, raw_notes: Any, *, existing_memory: str) -> list[str]:
-        if not isinstance(raw_notes, list):
-            return []
-
-        notes: list[str] = []
-        seen: set[str] = set()
-        for value in raw_notes:
-            if not isinstance(value, str):
-                continue
-            note = self._normalize_memory_note(value)
-            if not note:
-                continue
-            normalized = note.casefold()
-            if normalized in seen:
-                continue
-            if normalized in existing_memory.casefold():
-                continue
-            seen.add(normalized)
-            notes.append(note)
-        return notes
-
-    @staticmethod
-    def _normalize_memory_note(value: str) -> str:
-        note = value.strip()
-        note = re.sub(r"^[-*]\s+", "", note)
-        note = re.sub(r"^(?:\[[^\]]+\]\s*)+", "", note).strip()
-        note = re.sub(r"^[-*]\s+", "", note)
-        return note.strip()
-
-    def _should_route_owner_note_to_server(self, *, message: discord.Message, note: str) -> bool:
-        if message.guild is None:
-            return False
-
-        note_lower = note.casefold()
-        message_text = self._message_text_for_context(message).casefold()
-        has_member_reference = bool(re.search(r"<@!?\d+>", note)) or bool(getattr(message, "mentions", []))
-        behavior_keywords = (
-            "treat ",
-            "be cold",
-            "be distant",
-            "don't be ",
-            "do not be ",
-            "remember to ",
-            "call ",
-            "avoid ",
-            "never mention ",
-            "nickname",
-        )
-        server_scope_keywords = (
-            "server",
-            "guild",
-            "channel",
-            "here",
-            "in this chat",
-            "in here",
-        )
-
-        if any(keyword in message_text for keyword in server_scope_keywords):
-            return True
-        if has_member_reference and any(keyword in note_lower for keyword in behavior_keywords):
-            return True
-        if message_text.startswith("remember ") and has_member_reference:
-            return True
-        return False
-
-    @staticmethod
-    def _is_important_user_fact(note: str) -> bool:
-        note_lower = note.casefold()
-        important_markers = (
-            "is ",
-            "works at ",
-            "lives in ",
-            "birthday",
-            "pronouns",
-            "allergic",
-            "medical",
-            "project",
-            "building ",
-            "studying ",
-            "dating ",
-            "married ",
-            "family",
-            "prefers ",
-            "favorite ",
-            "goal",
-            "plan",
-        )
-        casual_markers = (
-            "tone",
-            "style",
-            "short replies",
-            "long replies",
-            "formatting",
-            "joke",
-            "banter",
-            "call them",
-            "nickname",
-            "be cold",
-            "be distant",
-            "don't be ",
-            "do not be ",
-            "remember to ",
-        )
-        if any(marker in note_lower for marker in casual_markers):
-            return False
-        return any(marker in note_lower for marker in important_markers)
-
     async def _should_treat_active_conversation_message_as_follow_up(
         self,
         message: discord.Message,
@@ -1895,7 +805,7 @@ class DiscoAssistant(discord.Client):
             if content:
                 transcript_lines.append(f"{role.upper()}: {content}")
 
-        response = await self.openrouter_chat(
+        response = await self.openrouter.chat(
             messages=[
                 {
                     "role": "system",
@@ -1922,7 +832,7 @@ class DiscoAssistant(discord.Client):
                 "max_tokens": 3,
             },
         )
-        decision = self.extract_response_text(response).strip().upper()
+        decision = extract_response_text(response).strip().upper()
         if not decision:
             heuristic = self._heuristic_active_follow_up_decision(message)
             if heuristic is not None:
@@ -1997,106 +907,12 @@ class DiscoAssistant(discord.Client):
 
         return None
 
-    async def _execute_tool_call(
-        self,
-        tool_call: dict[str, Any],
-        tool_context: dict[str, Any],
-    ) -> dict[str, Any]:
-        function_payload = tool_call.get("function", {})
-        function_name = function_payload.get("name", "")
-        raw_arguments = function_payload.get("arguments", "{}")
-        arguments = json.loads(raw_arguments)
-        started_at = monotonic()
-        LOGGER.info(
-            "Tool call start name=%s arguments=%s",
-            function_name,
-            raw_arguments,
-        )
-
-        if function_name == "get_channel_history":
-            result = await self._tool_get_channel_history(arguments, tool_context)
-        elif function_name == "append_user_memory":
-            result = await self._tool_append_user_memory(arguments, tool_context)
-        elif function_name == "edit_user_memory":
-            result = await self._tool_edit_user_memory(arguments, tool_context)
-        elif function_name == "get_user_memory":
-            result = await self._tool_get_user_memory(arguments, tool_context)
-        elif function_name == "append_server_memory":
-            result = await self._tool_append_server_memory(arguments, tool_context)
-        elif function_name == "edit_server_memory":
-            result = await self._tool_edit_server_memory(arguments, tool_context)
-        elif function_name == "preview_passive_server_memory_flush":
-            result = await self._tool_preview_passive_server_memory_flush(arguments, tool_context)
-        elif function_name == "flush_passive_server_memory":
-            result = await self._tool_flush_passive_server_memory(arguments, tool_context)
-        elif function_name == "cancel_passive_server_memory_flush":
-            result = await self._tool_cancel_passive_server_memory_flush(arguments, tool_context)
-        elif function_name == "get_user_details":
-            result = await self._tool_get_user_details(arguments, tool_context)
-        elif function_name == "send_message":
-            result = await self._tool_send_message(arguments, tool_context)
-        else:
-            raise RuntimeError(f"Unsupported tool call: {function_name}")
-
-        LOGGER.info(
-            "Tool call success name=%s duration=%.2fs ok=%s",
-            function_name,
-            monotonic() - started_at,
-            result.get("ok"),
-        )
-        return result
-
-    async def _tool_get_channel_history(
-        self,
-        arguments: dict[str, Any],
-        tool_context: dict[str, Any],
-    ) -> dict[str, Any]:
-        message: discord.Message = tool_context["message"]
-        limit = int(arguments.get("limit", self.app_config.runtime.discord.max_history_messages))
-        limit = max(1, min(limit, 100))
-        requested_channel_id = arguments.get("target_channel_id")
-        target_channel = message.channel
-        before_message_id = arguments.get("before_message_id", message.id)
-        if requested_channel_id is not None:
-            target_channel_id = int(requested_channel_id)
-            target_channel = self._channel_from_message_context(message, target_channel_id)
-            if target_channel is None:
-                fetched_channel = await self.fetch_channel(target_channel_id)
-                target_channel = fetched_channel
-            before_message_id = arguments.get("before_message_id")
-        LOGGER.info(
-            "Fetching channel history requester=%s target_channel_id=%s limit=%s before_message_id=%s",
-            message.author.id,
-            getattr(target_channel, "id", None),
-            limit,
-            before_message_id,
-        )
-
-        if not hasattr(target_channel, "history"):
-            raise ValueError("get_channel_history target channel does not support message history.")
-
-        before_message = discord.Object(id=int(before_message_id)) if before_message_id is not None else None
-        history = []
-        async for item in target_channel.history(limit=limit, before=before_message, oldest_first=False):
-            history.append(
-                {
-                    "message_id": item.id,
-                    "author_username": str(item.author),
-                    "author_display_name": self._display_name_for_message_author(item),
-                    "content": self._message_text_for_context(item),
-                    "created_at": item.created_at.isoformat(),
-                }
-            )
-            self._store_historical_dm_message(item)
-
-        return {
-            "channel_id": target_channel.id,
-            "fetched_count": len(history),
-            "messages": history,
-        }
-
     async def _prefetch_channel_history_for_message(self, message: discord.Message) -> str:
-        history_payload = await self._tool_get_channel_history({}, {"message": message})
+        history_payload = await self.tool_registry.dispatch(
+            "read_channel_messages",
+            {},
+            ToolContext(message=message, services=self),
+        )
         history_messages = history_payload.get("messages", [])
         if not history_messages:
             return "Recent channel context:\n(none)\n"
@@ -2108,409 +924,6 @@ class DiscoAssistant(discord.Client):
             lines.append(f"- {author_name}: {content}")
         lines.append("")
         return "\n".join(lines)
-
-    async def _tool_append_user_memory(
-        self,
-        arguments: dict[str, Any],
-        tool_context: dict[str, Any],
-    ) -> dict[str, Any]:
-        message: discord.Message = tool_context["message"]
-        self._require_owner(message, "append_user_memory")
-        note = str(arguments.get("note", "")).strip()
-        if not note:
-            raise ValueError("append_user_memory.note is required.")
-
-        path = self.user_memory_store.append_for_user(
-            user_id=message.author.id,
-            note=note,
-            author_display_name=self._display_name_for_message_author(message),
-            source_channel_id=message.channel.id,
-        )
-        return {
-            "ok": True,
-            "user_id": message.author.id,
-            "path": str(path),
-            "appended_note": note,
-        }
-
-    async def _tool_edit_user_memory(
-        self,
-        arguments: dict[str, Any],
-        tool_context: dict[str, Any],
-    ) -> dict[str, Any]:
-        message: discord.Message = tool_context["message"]
-        self._require_owner(message, "edit_user_memory")
-        old_text = str(arguments.get("old_text", "")).strip()
-        new_text = str(arguments.get("new_text", "")).strip()
-        if not old_text or not new_text:
-            raise ValueError("edit_user_memory.old_text and new_text are required.")
-
-        path, updated = self.user_memory_store.replace_for_user(
-            user_id=message.author.id,
-            old_text=old_text,
-            new_text=new_text,
-        )
-        return {
-            "ok": updated,
-            "user_id": message.author.id,
-            "path": str(path),
-            "old_text": old_text,
-            "new_text": new_text,
-            "status": "updated" if updated else "not_found",
-        }
-
-    async def _tool_get_user_memory(
-        self,
-        arguments: dict[str, Any],
-        tool_context: dict[str, Any],
-    ) -> dict[str, Any]:
-        message: discord.Message = tool_context["message"]
-        self._require_owner(message, "get_user_memory")
-
-        requested_target_user_id = arguments.get("target_user_id")
-        if requested_target_user_id is None:
-            raise ValueError("get_user_memory.target_user_id is required.")
-        target_user_id = self._resolve_target_user_id(message, requested_target_user_id)
-        LOGGER.info("Reading user memory requester=%s target_user_id=%s", message.author.id, target_user_id)
-
-        path = self.user_memory_store.path_for_user(target_user_id)
-        content = self.user_memory_store.read_for_user(target_user_id)
-        return {
-            "ok": True,
-            "target_user_id": target_user_id,
-            "path": str(path),
-            "exists": bool(content),
-            "memory": content or "",
-        }
-
-    async def _tool_get_user_details(
-        self,
-        arguments: dict[str, Any],
-        tool_context: dict[str, Any],
-    ) -> dict[str, Any]:
-        message: discord.Message = tool_context["message"]
-        requested_target_user_id = arguments.get("target_user_id")
-        target_user_id = (
-            self._resolve_target_user_id(message, requested_target_user_id)
-            if requested_target_user_id is not None
-            else message.author.id
-        )
-
-        member = self._member_from_message_context(message, target_user_id)
-        user = member or self._user_from_message_context(message, target_user_id)
-        if user is None:
-            user = await self.fetch_user(target_user_id)
-
-        profile: Any | None = None
-        profile_error: str | None = None
-        try:
-            if member is not None:
-                profile = await member.profile(
-                    with_mutual_guilds=True,
-                    with_mutual_friends_count=False,
-                    with_mutual_friends=False,
-                )
-            elif hasattr(user, "profile"):
-                profile = await user.profile(
-                    with_mutual_guilds=True,
-                    with_mutual_friends_count=False,
-                    with_mutual_friends=False,
-                )
-        except discord.HTTPException as exc:
-            profile_error = f"{type(exc).__name__}: {exc}"
-
-        effective_member = member if member is not None else (user if isinstance(user, discord.Member) else None)
-        display_name = (
-            self._display_name_for_message_author(message)
-            if target_user_id == message.author.id
-            else getattr(effective_member or user, "display_name", str(user))
-        )
-        bio = getattr(profile, "display_bio", None)
-        if bio is None:
-            bio = getattr(profile, "bio", None)
-        if bio is None:
-            bio = getattr(user, "bio", None)
-
-        metadata = getattr(profile, "metadata", None)
-        mutual_guilds = getattr(profile, "mutual_guilds", None)
-        avatar = getattr(user, "display_avatar", None)
-        banner = getattr(effective_member, "display_banner", None) or getattr(user, "banner", None)
-        accent_color = None
-        if metadata is not None and getattr(metadata, "accent_color", None) is not None:
-            accent_color = str(metadata.accent_color)
-        elif getattr(user, "accent_color", None) is not None:
-            accent_color = str(user.accent_color)
-
-        result: dict[str, Any] = {
-            "ok": True,
-            "target_user_id": user.id,
-            "username": str(user),
-            "name": getattr(user, "name", None),
-            "display_name": display_name,
-            "global_name": getattr(user, "global_name", None),
-            "mention": getattr(user, "mention", f"<@{user.id}>"),
-            "bot": getattr(user, "bot", False),
-            "system": getattr(user, "system", False),
-            "created_at": user.created_at.isoformat() if getattr(user, "created_at", None) else None,
-            "avatar_url": str(avatar.url) if avatar is not None else None,
-            "banner_url": str(banner.url) if banner is not None else None,
-            "accent_color": accent_color,
-            "bio": bio,
-            "legacy_username": getattr(profile, "legacy_username", None),
-            "profile_fetch_ok": profile_error is None,
-            "profile_fetch_error": profile_error,
-            "guild_member": {
-                "in_current_guild": effective_member is not None,
-                "nick": getattr(effective_member, "nick", None) if effective_member is not None else None,
-                "joined_at": (
-                    effective_member.joined_at.isoformat()
-                    if effective_member is not None and getattr(effective_member, "joined_at", None)
-                    else None
-                ),
-                "guild_bio": getattr(profile, "guild_bio", None),
-            },
-            "mutual_guilds": (
-                [
-                    {
-                        "id": guild.id,
-                        "name": getattr(getattr(guild, "guild", None), "name", None),
-                        "nick": getattr(guild, "nick", None),
-                    }
-                    for guild in mutual_guilds[:10]
-                ]
-                if mutual_guilds
-                else []
-            ),
-        }
-        if metadata is not None:
-            result["profile_metadata"] = {
-                "pronouns": getattr(metadata, "pronouns", None),
-                "banner_url": str(metadata.banner.url) if getattr(metadata, "banner", None) is not None else None,
-            }
-        return result
-
-    async def _tool_append_server_memory(
-        self,
-        arguments: dict[str, Any],
-        tool_context: dict[str, Any],
-    ) -> dict[str, Any]:
-        message: discord.Message = tool_context["message"]
-        self._require_owner(message, "append_server_memory")
-        if message.guild is None:
-            raise ValueError("append_server_memory requires a guild/server channel.")
-
-        note = str(arguments.get("note", "")).strip()
-        if not note:
-            raise ValueError("append_server_memory.note is required.")
-        LOGGER.info(
-            "Appending server memory requester=%s guild_id=%s channel_id=%s note_chars=%s",
-            message.author.id,
-            message.guild.id,
-            message.channel.id,
-            len(note),
-        )
-
-        path = self.guild_memory_store.append_for_guild(
-            guild_id=message.guild.id,
-            guild_name=message.guild.name,
-            note=note,
-            author_display_name=self._display_name_for_message_author(message),
-            source_channel_id=message.channel.id,
-            owner_priority=True,
-        )
-        await self._notify_owner_of_guild_memory_update(
-            guild_id=message.guild.id,
-            guild_name=message.guild.name,
-            summary=(
-                "Owner-approved guild memory append:\n"
-                f"- channel_id: {message.channel.id}\n"
-                f"- author: {self._display_name_for_message_author(message)}\n"
-                f"- note: {note}"
-            ),
-        )
-        return {
-            "ok": True,
-            "guild_id": message.guild.id,
-            "guild_name": message.guild.name,
-            "path": str(path),
-            "appended_note": note,
-        }
-
-    async def _tool_edit_server_memory(
-        self,
-        arguments: dict[str, Any],
-        tool_context: dict[str, Any],
-    ) -> dict[str, Any]:
-        message: discord.Message = tool_context["message"]
-        self._require_owner(message, "edit_server_memory")
-        if message.guild is None:
-            raise ValueError("edit_server_memory requires a guild/server channel.")
-
-        old_text = str(arguments.get("old_text", "")).strip()
-        new_text = str(arguments.get("new_text", "")).strip()
-        if not old_text or not new_text:
-            raise ValueError("edit_server_memory.old_text and new_text are required.")
-        LOGGER.info(
-            "Editing server memory requester=%s guild_id=%s old_chars=%s new_chars=%s",
-            message.author.id,
-            message.guild.id,
-            len(old_text),
-            len(new_text),
-        )
-
-        path, updated = self.guild_memory_store.replace_for_guild(
-            guild_id=message.guild.id,
-            old_text=old_text,
-            new_text=new_text,
-        )
-        if updated:
-            await self._notify_owner_of_guild_memory_update(
-                guild_id=message.guild.id,
-                guild_name=message.guild.name,
-                summary=(
-                    "Owner-approved guild memory edit:\n"
-                    f"- old: {old_text}\n"
-                    f"- new: {new_text}"
-                ),
-            )
-        return {
-            "ok": updated,
-            "guild_id": message.guild.id,
-            "guild_name": message.guild.name,
-            "path": str(path),
-            "old_text": old_text,
-            "new_text": new_text,
-            "status": "updated" if updated else "not_found",
-        }
-
-    async def _tool_flush_passive_server_memory(
-        self,
-        arguments: dict[str, Any],
-        tool_context: dict[str, Any],
-    ) -> dict[str, Any]:
-        message: discord.Message = tool_context["message"]
-        self._require_owner(message, "flush_passive_server_memory")
-
-        requested_guild_id = arguments.get("guild_id")
-        if requested_guild_id is None:
-            if message.guild is None:
-                raise ValueError("flush_passive_server_memory.guild_id is required outside a guild channel.")
-            guild_id = message.guild.id
-        else:
-            guild_id = int(requested_guild_id)
-        confirmation = self._consume_passive_flush_confirmation(
-            guild_id=guild_id,
-            requester_user_id=message.author.id,
-        )
-        if confirmation is None:
-            raise ValueError(
-                "Preview required before flush. Call preview_passive_server_memory_flush first, tell the user how many messages are queued, and only flush after they explicitly confirm."
-            )
-        LOGGER.info("Forcing passive server memory flush requester=%s guild_id=%s", message.author.id, guild_id)
-
-        if not self._passive_guild_enabled_for_guild(guild_id):
-            raise ValueError(f"Passive guild memory is not enabled for guild_id={guild_id}.")
-
-        result = await self._flush_passive_guild_memory_now(guild_id)
-        result["preview_pending_message_count"] = confirmation.pending_message_count
-        return result
-
-    async def _tool_preview_passive_server_memory_flush(
-        self,
-        arguments: dict[str, Any],
-        tool_context: dict[str, Any],
-    ) -> dict[str, Any]:
-        del arguments
-        message: discord.Message = tool_context["message"]
-        self._require_owner(message, "preview_passive_server_memory_flush")
-        if message.guild is None:
-            raise ValueError("preview_passive_server_memory_flush requires a guild/server channel.")
-
-        guild_id = message.guild.id
-        pending_count = self._pending_passive_guild_message_count(guild_id)
-        self._register_passive_flush_confirmation(
-            guild_id=guild_id,
-            requester_user_id=message.author.id,
-            pending_message_count=pending_count,
-        )
-        return {
-            "ok": True,
-            "guild_id": guild_id,
-            "guild_name": message.guild.name,
-            "pending_message_count": pending_count,
-            "confirmation_required": True,
-            "confirmation_window_seconds": 300,
-            "status": "preview_ready",
-        }
-
-    async def _tool_cancel_passive_server_memory_flush(
-        self,
-        arguments: dict[str, Any],
-        tool_context: dict[str, Any],
-    ) -> dict[str, Any]:
-        del arguments
-        message: discord.Message = tool_context["message"]
-        self._require_owner(message, "cancel_passive_server_memory_flush")
-        if message.guild is None:
-            raise ValueError("cancel_passive_server_memory_flush requires a guild/server channel.")
-
-        cancelled = self._discard_passive_flush_confirmation(
-            guild_id=message.guild.id,
-            requester_user_id=message.author.id,
-        )
-        return {
-            "ok": cancelled,
-            "guild_id": message.guild.id,
-            "guild_name": message.guild.name,
-            "status": "cancelled" if cancelled else "no_pending_confirmation",
-        }
-
-    async def _tool_send_message(
-        self,
-        arguments: dict[str, Any],
-        tool_context: dict[str, Any],
-    ) -> dict[str, Any]:
-        message: discord.Message = tool_context["message"]
-        author_id = message.author.id
-        owner_user_id = self.app_config.settings.owner_user_id
-        is_owner = author_id == owner_user_id
-
-        requested_target_user_id = arguments.get("target_user_id")
-        if requested_target_user_id is None:
-            raise ValueError("send_message.target_user_id is required. Do not guess recipient.")
-        target_user_id = self._resolve_target_user_id(message, requested_target_user_id)
-
-        content = str(arguments.get("message", "")).strip()
-        if not content:
-            raise ValueError("send_message.message is required.")
-
-        if not is_owner and target_user_id != owner_user_id:
-            raise ValueError("Only owner can send DMs to arbitrary users.")
-        if self.user is not None and target_user_id == self.user.id:
-            raise ValueError("Do not DM logged-in assistant account.")
-
-        user = self.get_user(target_user_id)
-        if user is None:
-            user = await self.fetch_user(target_user_id)
-
-        dm_channel = user.dm_channel
-        if dm_channel is None:
-            dm_channel = await user.create_dm()
-
-        sent_message = await dm_channel.send(content)
-        self._store_outgoing_dm_message(sent_message)
-        return {
-            "ok": True,
-            "from_user_id": author_id,
-            "target_user_id": target_user_id,
-            "dm_channel_id": dm_channel.id,
-            "message_id": sent_message.id,
-            "sent_message": content,
-        }
-
-    def _require_owner(self, message: discord.Message, tool_name: str) -> None:
-        if message.author.id != self.app_config.settings.owner_user_id:
-            raise ValueError(f"{tool_name} is restricted to the owner.")
 
     def _resolve_target_user_id(self, message: discord.Message, raw_value: Any) -> int:
         if isinstance(raw_value, int):
@@ -2548,13 +961,7 @@ class DiscoAssistant(discord.Client):
             return ""
         return self.user_memory_store.read_for_prompt(message.author.id)
 
-    async def _notify_owner_of_guild_memory_update(
-        self,
-        *,
-        guild_id: int,
-        guild_name: str,
-        summary: str,
-    ) -> None:
+    async def _send_dm_to_owner(self, content: str) -> None:
         owner_user_id = self.app_config.settings.owner_user_id
         user = self.get_user(owner_user_id)
         if user is None:
@@ -2564,10 +971,6 @@ class DiscoAssistant(discord.Client):
         if dm_channel is None:
             dm_channel = await user.create_dm()
 
-        content = (
-            f"Guild memory updated for {guild_name} ({guild_id}).\n"
-            f"{summary.strip()}"
-        ).strip()
         sent_message = await dm_channel.send(content, silent=True)
         self._store_outgoing_dm_message(sent_message)
 
@@ -2646,9 +1049,123 @@ class DiscoAssistant(discord.Client):
             discord_message_id=message.id,
             created_at=message.created_at.isoformat() if message.created_at else None,
         )
+        self._maybe_schedule_dm_resummary(recipient.id)
 
     def _dm_conversation_context_for_message(self, message: discord.Message) -> list[dict[str, str]]:
-        return self.dm_history_store.read_conversation(user_id=message.author.id)
+        memory_config = self.app_config.runtime.memory
+        max_tail = max(1, memory_config.dm_max_recent_turns)
+        _, tail = self.dm_history_store.read_conversation_for_prompt(
+            user_id=message.author.id,
+            max_tail=max_tail,
+        )
+        return tail
+
+    def _dm_summary_block_for_user(self, user_id: int) -> str:
+        memory_config = self.app_config.runtime.memory
+        max_tail = max(1, memory_config.dm_max_recent_turns)
+        summary, _ = self.dm_history_store.read_conversation_for_prompt(
+            user_id=user_id,
+            max_tail=max_tail,
+        )
+        if not summary:
+            return ""
+        return f"Older DM summary:\n{summary.strip()}\n"
+
+    def _maybe_schedule_dm_resummary(self, user_id: int) -> None:
+        memory_config = self.app_config.runtime.memory
+        if memory_config.dm_summary_threshold_turns <= 0:
+            return
+        summary_through_id, max_message_id = self.dm_history_store.get_summary_state(user_id=user_id)
+        unsummarized = max_message_id - summary_through_id
+        if unsummarized < memory_config.dm_summary_threshold_turns:
+            return
+        if user_id in self._dm_summary_in_flight:
+            return
+        self._dm_summary_in_flight.add(user_id)
+        asyncio.create_task(self._run_dm_resummary(user_id))
+
+    async def _run_dm_resummary(self, user_id: int) -> None:
+        memory_config = self.app_config.runtime.memory
+        try:
+            summary_through_id, max_message_id = self.dm_history_store.get_summary_state(user_id=user_id)
+            keep_recent = max(0, memory_config.dm_summary_keep_recent_turns)
+            cutoff_id = max_message_id - keep_recent
+            if cutoff_id <= summary_through_id:
+                return
+            rows = self.dm_history_store.read_messages_in_range(
+                user_id=user_id,
+                after_id=summary_through_id,
+                before_or_equal_id=cutoff_id,
+            )
+            if not rows:
+                return
+
+            transcript_lines = []
+            for row in rows:
+                role = row.get("role") or "user"
+                content = (row.get("content") or "").strip()
+                if not content:
+                    continue
+                transcript_lines.append(f"{role}: {content}")
+            if not transcript_lines:
+                return
+
+            previous_summary, _ = self.dm_history_store.read_conversation_for_prompt(
+                user_id=user_id,
+                max_tail=0,
+            )
+            summary_model = (
+                memory_config.dm_summary_model
+                or self.app_config.runtime.passive_guild_memory.primary_model
+                or self.app_config.runtime.openrouter.default_model
+            )
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "Compress this DM transcript into a dense factual summary. "
+                        "Preserve durable user details, ongoing topics, decisions, preferences, and unresolved threads. "
+                        "Drop greetings, fillers, and small talk. Output plain prose, no headings, no JSON."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        (f"Previous summary:\n{previous_summary.strip()}\n\n" if previous_summary else "")
+                        + "New transcript to merge in:\n"
+                        + "\n".join(transcript_lines)
+                    ),
+                },
+            ]
+            response = await self.openrouter.chat(
+                model=summary_model,
+                messages=messages,
+                extra_payload={
+                    "temperature": memory_config.dm_summary_temperature,
+                    "max_tokens": memory_config.dm_summary_max_output_tokens,
+                },
+            )
+            choice = response.get("choices", [{}])[0].get("message", {})
+            new_summary_text = (choice.get("content") or "").strip()
+            if not new_summary_text:
+                LOGGER.warning("DM resummary returned empty content user_id=%s", user_id)
+                return
+            self.dm_history_store.upsert_summary(
+                user_id=user_id,
+                summary_text=new_summary_text,
+                summary_through_id=cutoff_id,
+                updated_at=datetime.now(UTC).replace(microsecond=0).isoformat(),
+            )
+            LOGGER.info(
+                "DM resummary updated user_id=%s through_id=%s rows_summarized=%s",
+                user_id,
+                cutoff_id,
+                len(rows),
+            )
+        except Exception:
+            LOGGER.exception("DM resummary failed user_id=%s", user_id)
+        finally:
+            self._dm_summary_in_flight.discard(user_id)
 
     def _should_prefetch_channel_context(self, message: discord.Message) -> bool:
         if self._is_direct_message(message):
@@ -2671,335 +1188,23 @@ class DiscoAssistant(discord.Client):
         return any(cue in content for cue in history_cues)
 
     def _tool_schemas_for_agent(self, allowed_tool_names: list[str]) -> list[dict[str, Any]]:
-        if not self.app_config.runtime.tool_policy.allow_model_tool_calls:
-            return []
-
         enabled_tools = {
             tool.name
             for tool in self.app_config.runtime.tool_policy.registry
             if tool.enabled
         }
-        allowed = enabled_tools.intersection(allowed_tool_names)
-        schemas: list[dict[str, Any]] = []
-
-        if "get_channel_history" in allowed:
-            schemas.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "get_channel_history",
-                        "description": (
-                            "Fetch past messages from the current Discord channel or an explicitly referenced channel for context. "
-                            "Use default limit unless more context is needed. To paginate farther "
-                            "back, call again with a smaller before_message_id from an older message."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "limit": {
-                                    "type": "integer",
-                                    "description": (
-                                        "Number of past channel messages to fetch. "
-                                        "Discord default-style history size is fine unless more context is needed."
-                                    ),
-                                    "minimum": 1,
-                                    "maximum": 100,
-                                },
-                                "before_message_id": {
-                                    "type": "integer",
-                                    "description": (
-                                        "Fetch messages before this message id. "
-                                        "Use returned older message ids to paginate farther back."
-                                    ),
-                                },
-                                "target_channel_id": {
-                                    "type": "integer",
-                                    "description": (
-                                        "Optional explicit Discord channel id. Use this when the user mentions a specific #channel."
-                                    ),
-                                },
-                            },
-                            "required": [],
-                            "additionalProperties": False,
-                        },
-                    },
-                }
-            )
-
-        if "append_user_memory" in allowed:
-            schemas.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "append_user_memory",
-                        "description": (
-                            "Append durable notes about current Discord user to that user's markdown memory file. "
-                            "Use for useful long-term facts, preferences, plans, personal context, repeated habits, "
-                            "interaction style, response preferences, phrasing patterns, or small reusable details likely to help in future conversations."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "note": {
-                                    "type": "string",
-                                    "description": (
-                                        "Short markdown-safe note to append to this user's memory file. "
-                                        "Write concise durable context worth remembering, including collaboration cues like tone, detail level, formatting likes, or recognizable habits."
-                                    ),
-                                }
-                            },
-                            "required": ["note"],
-                            "additionalProperties": False,
-                        },
-                    },
-                }
-            )
-
-        if "edit_user_memory" in allowed:
-            schemas.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "edit_user_memory",
-                        "description": (
-                            "Update stale or changed facts inside current user's markdown memory file by replacing "
-                            "specific old text with new text. Use when existing memory is wrong, outdated, or changed."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "old_text": {
-                                    "type": "string",
-                                    "description": "Exact existing text snippet from user memory that should be replaced.",
-                                },
-                                "new_text": {
-                                    "type": "string",
-                                    "description": "New replacement text that should overwrite old_text.",
-                                },
-                            },
-                            "required": ["old_text", "new_text"],
-                            "additionalProperties": False,
-                        },
-                    },
-                }
-            )
-
-        if "get_user_memory" in allowed:
-            schemas.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "get_user_memory",
-                        "description": (
-                            "Owner-only: read the persistent user memory file for a specific Discord user id."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "target_user_id": {
-                                    "type": "integer",
-                                    "description": (
-                                        "Discord user id whose memory file should be read."
-                                    ),
-                                }
-                            },
-                            "required": ["target_user_id"],
-                            "additionalProperties": False,
-                        },
-                    },
-                }
-            )
-
-        if "append_server_memory" in allowed:
-            schemas.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "append_server_memory",
-                        "description": (
-                            "Owner-only: append a server-wide rule, policy, or durable guild fact to the current server memory. "
-                            "Use this for instructions from the real owner that should apply across the whole server, not just to the owner, plus durable shared norms or interaction patterns."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "note": {
-                                    "type": "string",
-                                    "description": (
-                                        "Short markdown-safe note to append to this server's memory file."
-                                    ),
-                                }
-                            },
-                            "required": ["note"],
-                            "additionalProperties": False,
-                        },
-                    },
-                }
-            )
-
-        if "edit_server_memory" in allowed:
-            schemas.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "edit_server_memory",
-                        "description": (
-                            "Owner-only: update stale or changed server-wide rules or facts inside current server memory."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "old_text": {
-                                    "type": "string",
-                                    "description": "Exact existing text snippet from server memory that should be replaced.",
-                                },
-                                "new_text": {
-                                    "type": "string",
-                                    "description": "New replacement text that should overwrite old_text.",
-                                },
-                            },
-                            "required": ["old_text", "new_text"],
-                            "additionalProperties": False,
-                        },
-                    },
-                }
-            )
-
-        if "preview_passive_server_memory_flush" in allowed:
-            schemas.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "preview_passive_server_memory_flush",
-                        "description": (
-                            "Owner-only: check how many passive server-memory messages are queued for the current server and start a confirmation window. "
-                            "Use this first when the owner asks to flush passive server memory. After calling this, tell the owner the queued count and ask whether to continue. "
-                            "Do not call flush_passive_server_memory until the owner explicitly confirms."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {},
-                            "required": [],
-                            "additionalProperties": False,
-                        },
-                    },
-                }
-            )
-
-        if "cancel_passive_server_memory_flush" in allowed:
-            schemas.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "cancel_passive_server_memory_flush",
-                        "description": (
-                            "Owner-only: cancel a pending passive server-memory flush confirmation for the current server. "
-                            "Use this when the owner says no, cancel, stop, or otherwise declines the flush after a preview."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {},
-                            "required": [],
-                            "additionalProperties": False,
-                        },
-                    },
-                }
-            )
-
-        if "flush_passive_server_memory" in allowed:
-            schemas.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "flush_passive_server_memory",
-                        "description": (
-                            "Owner-only: force the passive guild memory queue to summarize now for the current server, "
-                            "or for an explicit guild id. Only use this after preview_passive_server_memory_flush was called and the owner explicitly confirmed they want to continue."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "guild_id": {
-                                    "type": "integer",
-                                    "description": (
-                                        "Optional guild/server id. Leave unset in a server channel to use the current guild."
-                                    ),
-                                }
-                            },
-                            "required": [],
-                            "additionalProperties": False,
-                        },
-                    },
-                }
-            )
-
-        if "get_user_details" in allowed:
-            schemas.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "get_user_details",
-                        "description": (
-                            "Fetch profile details for current chatter by default, or for an explicit Discord user id. "
-                            "Use this when user asks who someone is, wants their user id, bio, profile details, "
-                            "or more context about the current chatter."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "target_user_id": {
-                                    "type": "integer",
-                                    "description": (
-                                        "Optional Discord user id to inspect. Omit to inspect current message author."
-                                    ),
-                                }
-                            },
-                            "required": [],
-                            "additionalProperties": False,
-                        },
-                    },
-                }
-            )
-
-        if "send_message" in allowed:
-            schemas.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "send_message",
-                        "description": (
-                            "Send direct message to Discord user. Non-owner users may only message owner. "
-                            "Owner may message any user. Never use this unless target user id is explicit."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "target_user_id": {
-                                    "type": "integer",
-                                    "description": (
-                                        "Discord user id to DM. Required. Use owner user id when user wants to message owner."
-                                    ),
-                                },
-                                "message": {
-                                    "type": "string",
-                                    "description": "Direct message content to send.",
-                                },
-                            },
-                            "required": ["target_user_id", "message"],
-                            "additionalProperties": False,
-                        },
-                    },
-                }
-            )
-
-        return schemas
+        return self.tool_registry.schemas_for(
+            allowed_tool_names,
+            allow_model_tool_calls=self.app_config.runtime.tool_policy.allow_model_tool_calls,
+            enabled_names=enabled_tools,
+        )
 
     def _tool_choice_for_message(self, message: discord.Message) -> str | dict[str, Any]:
         if self._is_mention_without_other_text(message):
             return {
                 "type": "function",
                 "function": {
-                    "name": "get_channel_history",
+                    "name": "read_channel_messages",
                 },
             }
         return "auto"
@@ -3011,34 +1216,13 @@ class DiscoAssistant(discord.Client):
 
     def _has_pending_reply(self, message: discord.Message) -> bool:
         key = self._conversation_key(message)
-        task = self._reply_tasks.get(key)
-        return key in self._pending_replies or (task is not None and not task.done())
+        task = self.in_flight.get(key)
+        return self.pending.has(key) or (task is not None and not task.done())
 
     def _get_active_conversation(self, message: discord.Message) -> ActiveConversation | None:
         if self._is_direct_message(message):
             return None
-        key = self._conversation_key(message)
-        conversation = self._active_conversations.get(key)
-        if conversation is None:
-            return None
-
-        if conversation.expires_at <= monotonic():
-            del self._active_conversations[key]
-            return None
-
-        return conversation
-
-    def _active_conversation_keys_for_channel(self, channel_id: int) -> list[tuple[int, int]]:
-        keys: list[tuple[int, int]] = []
-        now = monotonic()
-        for key, conversation in list(self._active_conversations.items()):
-            if key[0] != channel_id:
-                continue
-            if conversation.expires_at <= now:
-                del self._active_conversations[key]
-                continue
-            keys.append(key)
-        return keys
+        return self.conversation_store.get(self._conversation_key(message))
 
     def _store_active_conversation(
         self,
@@ -3048,18 +1232,12 @@ class DiscoAssistant(discord.Client):
         user_message: dict[str, str],
         assistant_reply: str,
     ) -> None:
-        conversation_messages: list[dict[str, str]] = []
-        if prior_conversation is not None:
-            conversation_messages.extend(prior_conversation.messages)
-
-        conversation_messages.append(user_message)
-        conversation_messages.append({"role": "assistant", "content": assistant_reply})
-        conversation_messages = conversation_messages[-12:]
-
-        self._active_conversations[self._conversation_key(message)] = ActiveConversation(
-            messages=conversation_messages,
-            expires_at=monotonic() + self.app_config.runtime.discord.conversation_window_seconds,
-            interrupted_by_other_user=False,
+        prior_messages = prior_conversation.messages if prior_conversation is not None else None
+        self.conversation_store.store(
+            self._conversation_key(message),
+            prior_messages=prior_messages,
+            user_message=user_message,
+            assistant_reply=assistant_reply,
         )
 
     def _append_passive_channel_context(self, message: discord.Message) -> None:
@@ -3069,37 +1247,14 @@ class DiscoAssistant(discord.Client):
         if message.author.id == self.user.id:
             return
 
-        content = message.content.strip()
-        if not content:
-            return
-
-        for key in self._active_conversation_keys_for_channel(message.channel.id):
-            if key[1] == message.author.id:
-                continue
-
-            conversation = self._active_conversations.get(key)
-            if conversation is None:
-                continue
-
-            conversation.messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "Channel context update from another user. This message was not directed at you, "
-                        "but happened in same channel during active conversation.\n"
-                        f"Author username: {message.author}\n"
-                        f"Author display name: {self._display_name_for_message_author(message)}\n"
-                        f"Channel message: {content}"
-                    ),
-                }
-            )
-            conversation.messages = conversation.messages[-12:]
-            conversation.expires_at = monotonic() + self.app_config.runtime.discord.conversation_window_seconds
-            conversation.interrupted_by_other_user = True
+        self.conversation_store.mark_interrupted(
+            message,
+            author_display_name=self._display_name_for_message_author(message),
+        )
 
     @staticmethod
-    def _conversation_key(message: discord.Message) -> tuple[int, int]:
-        return (message.channel.id, message.author.id)
+    def _conversation_key(message: discord.Message) -> ConversationKey:
+        return conversation_key(message)
 
     @staticmethod
     def _is_direct_message(message: discord.Message) -> bool:
@@ -3124,49 +1279,6 @@ class DiscoAssistant(discord.Client):
         if message.author.id == self.app_config.settings.owner_user_id:
             return self.app_config.runtime.agents["owner"]
         return self.app_config.runtime.agents["public"]
-
-    @staticmethod
-    def extract_response_text(
-        response: dict[str, Any],
-        *,
-        messages: list[dict[str, Any]] | None = None,
-    ) -> str:
-        choices = response.get("choices", [])
-        if not choices:
-            LOGGER.warning("OpenRouter response had no choices. Falling back to default reply.")
-            return DiscoAssistant._fallback_response_text(
-                messages,
-                default="I couldn't produce a reply just now.",
-            )
-
-        choice = choices[0]
-        finish_reason = choice.get("finish_reason")
-        message = choices[0].get("message", {})
-        content = message.get("content", "")
-
-        if isinstance(content, str):
-            text = content.strip()
-            if text:
-                return text
-
-        if isinstance(content, list):
-            text_parts: list[str] = []
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    text_value = item.get("text", "").strip()
-                    if text_value:
-                        text_parts.append(text_value)
-            if text_parts:
-                return "\n".join(text_parts)
-
-        LOGGER.warning(
-            "OpenRouter response had no usable text content. finish_reason=%r content_type=%s tool_calls=%s message_keys=%s",
-            finish_reason,
-            type(content).__name__,
-            bool(message.get("tool_calls")),
-            sorted(message.keys()),
-        )
-        return DiscoAssistant._fallback_response_text(messages)
 
     @staticmethod
     def _display_name_for_message_author(message: discord.Message) -> str:
@@ -3299,85 +1411,40 @@ class DiscoAssistant(discord.Client):
         self._owner_context_prompt_cache = "\n".join(prompt_lines) + "\n"
         return self._owner_context_prompt_cache
 
-    def _owner_only_tools_prompt(self, active_agent_name: str) -> str:
-        owner_agent = self.app_config.runtime.agents.get("owner")
-        public_agent = self.app_config.runtime.agents.get("public")
-        if owner_agent is None or public_agent is None:
+    def _load_static_system_prompt(self) -> str:
+        path = PROMPTS_DIR / "system.md"
+        owner_user_id = self.app_config.settings.owner_user_id
+        try:
+            template = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            LOGGER.warning("Static system prompt file missing path=%s", path)
             return ""
-
-        owner_only_tools = [tool for tool in owner_agent.tools if tool not in public_agent.tools]
-        if not owner_only_tools:
-            return ""
-
-        lines = [
-            "Owner-only capabilities:",
-            f"- real owner agent name: {owner_agent.name}",
-            f"- current active agent name: {active_agent_name}",
-            f"- owner-only tool calls: {', '.join(owner_only_tools)}",
-            "- If current user is not owner, these tool calls are not available to you.",
-            "- If a non-owner asks for an owner-only action, explain limitation briefly.",
-            "- Only if escalation is genuinely needed, ping real owner in channel using owner_mention.",
-            "- Never claim you used an owner-only tool unless tool result explicitly proves it.",
-        ]
-        return "\n".join(lines) + "\n"
+        return template.replace("{owner_user_id}", str(owner_user_id)).strip() + "\n"
 
     def _assistant_identity_prompt(self) -> str:
+        if self._assistant_identity_cache is not None:
+            return self._assistant_identity_cache
+
         owner_user_id = self.app_config.settings.owner_user_id
         if self.user is None:
-            return (
+            text = (
                 "Assistant identity:\n"
                 "- platform: Discord\n"
                 f"- owner_user_id: {owner_user_id}\n"
                 "- You are the logged-in user account for this assistant.\n"
             )
+            return text
 
-        return (
+        text = (
             "Assistant identity:\n"
             f"- account_username: {self.user}\n"
             f"- account_user_id: {self.user.id}\n"
             f"- account_mention: {self.user.mention}\n"
             f"- owner_user_id: {owner_user_id}\n"
             "- You are this Discord account. Do not confuse yourself with message author or owner.\n"
-            "- If user asks who you are, use this identity.\n"
         )
-
-    @staticmethod
-    def _fallback_response_text(
-        messages: list[dict[str, Any]] | None,
-        *,
-        default: str = "I couldn't produce a normal reply, but I can try again.",
-    ) -> str:
-        if messages:
-            for item in reversed(messages):
-                if item.get("role") != "tool":
-                    continue
-                try:
-                    payload = json.loads(item.get("content", "{}"))
-                except json.JSONDecodeError:
-                    continue
-
-                if payload.get("ok") is False:
-                    error_message = str(payload.get("error_message", "")).strip()
-                    if error_message:
-                        return f"Couldn't do that: {error_message}"
-                    return "Couldn't do that."
-
-                if item.get("name") == "send_message" and payload.get("ok") is True:
-                    target_user_id = payload.get("target_user_id")
-                    return f"Message sent to user `{target_user_id}`."
-
-        return default
-
-    @staticmethod
-    def _safe_runtime_error_reply(exc: Exception) -> str:
-        if isinstance(exc, aiohttp.ClientResponseError) and exc.status == 429:
-            if "openrouter.ai" in str(exc.request_info.real_url):
-                return "Model rate-limited me. Try again in a few seconds."
-            return "Rate-limited by upstream service. Try again in a few seconds."
-        message = str(exc).strip()
-        if message:
-            return f"I hit an internal error: {type(exc).__name__}: {message}"
-        return f"I hit an internal error: {type(exc).__name__}."
+        self._assistant_identity_cache = text
+        return text
 
     def _user_from_message_context(
         self,
@@ -3409,22 +1476,6 @@ class DiscoAssistant(discord.Client):
         if guild is None:
             return None
         return guild.get_member(user_id)
-
-    @staticmethod
-    def _retry_after_seconds(headers: Any) -> float | None:
-        if not headers:
-            return None
-
-        value = headers.get("Retry-After")
-        if value is None:
-            return None
-
-        try:
-            seconds = float(value)
-        except (TypeError, ValueError):
-            return None
-        return max(0.0, seconds)
-
 
 bot: DiscoAssistant | None = None
 
