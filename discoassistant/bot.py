@@ -334,12 +334,13 @@ class DiscoAssistant(discord.Client):
 
             guild_name = self._latest_guild_name(guild_id, rows)
             current_memory = self.guild_memory_store.read_for_guild(guild_id)
+            summarizer_memory = self.guild_memory_store.strip_owner_rules_section(current_memory).strip()
             if (
                 not force
                 and self._estimate_passive_guild_prompt_tokens(
                     guild_id=guild_id,
                     guild_name=guild_name,
-                    current_memory=current_memory,
+                    current_memory=summarizer_memory,
                     rows=rows,
                 ) < self._passive_guild_flush_threshold_tokens()
             ):
@@ -353,7 +354,7 @@ class DiscoAssistant(discord.Client):
             selected_rows = self._select_passive_guild_rows_for_flush(
                 guild_id=guild_id,
                 guild_name=guild_name,
-                current_memory=current_memory,
+                current_memory=summarizer_memory,
                 rows=rows,
             )
             if not selected_rows:
@@ -368,7 +369,7 @@ class DiscoAssistant(discord.Client):
             summary_payload = await self._summarize_passive_guild_rows(
                 guild_id=guild_id,
                 guild_name=guild_name,
-                current_memory=current_memory,
+                current_memory=summarizer_memory,
                 rows=selected_rows,
             )
             rendered_memory = self._render_passive_guild_memory_snapshot(

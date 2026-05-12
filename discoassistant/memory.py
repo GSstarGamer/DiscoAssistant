@@ -102,6 +102,7 @@ class UserMemoryStore:
 class GuildMemoryStore:
     base_dir: Path
     max_chars_in_prompt: int = 6000
+    owner_rules_header: str = "## Owner Rules"
 
     def __post_init__(self) -> None:
         self.base_dir.mkdir(parents=True, exist_ok=True)
@@ -157,12 +158,13 @@ class GuildMemoryStore:
             ).rstrip()
 
         if owner_priority:
-            entry = f"- [OWNER] {safe_note}"
+            normalized_rule = self._normalize_owner_rule_text(safe_note)
+            new_content = self._upsert_owner_rules(existing, [normalized_rule])
         else:
             author_suffix = f" | by {author_display_name}" if author_display_name else ""
             channel_suffix = f" | channel {source_channel_id}" if source_channel_id is not None else ""
             entry = f"- [{timestamp}{channel_suffix}{author_suffix}] {safe_note}"
-        new_content = f"{existing}\n{entry}\n"
+            new_content = f"{existing}\n{entry}\n"
         path.write_text(new_content, encoding="utf-8")
         return path
 
@@ -197,7 +199,12 @@ class GuildMemoryStore:
         content: str,
     ) -> Path:
         path = self.path_for_guild(guild_id)
-        path.write_text(content.rstrip() + "\n", encoding="utf-8")
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
+        owner_rules = self.extract_owner_rules(existing)
+        rendered = content.rstrip() + "\n"
+        if owner_rules:
+            rendered = self._upsert_owner_rules(rendered, owner_rules)
+        path.write_text(rendered, encoding="utf-8")
         return path
 
     def clear_for_guild(
@@ -217,5 +224,96 @@ class GuildMemoryStore:
             f"# Server Memory: {guild_id}\n\n"
             f"- Guild ID: {guild_id}\n"
             f"- Last known guild name: {safe_guild_name}\n"
-            f"- Notes:\n"
         )
+
+    def extract_owner_rules(self, content: str) -> list[str]:
+        if not content.strip():
+            return []
+        lines = content.splitlines()
+        start_index = None
+        for index, line in enumerate(lines):
+            if line.strip() == self.owner_rules_header:
+                start_index = index + 1
+                break
+        if start_index is None:
+            return []
+
+        rules: list[str] = []
+        for line in lines[start_index:]:
+            stripped = line.strip()
+            if stripped.startswith("## "):
+                break
+            if stripped.startswith("- "):
+                normalized = self._normalize_owner_rule_text(stripped[2:])
+                if normalized:
+                    rules.append(normalized)
+        return self._dedupe_owner_rules(rules)
+
+    def strip_owner_rules_section(self, content: str) -> str:
+        if not content.strip():
+            return content
+        lines = content.splitlines()
+        output: list[str] = []
+        in_owner_rules = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped == self.owner_rules_header:
+                in_owner_rules = True
+                continue
+            if in_owner_rules and stripped.startswith("## "):
+                in_owner_rules = False
+            if in_owner_rules:
+                continue
+            output.append(line)
+        cleaned = "\n".join(output)
+        cleaned = cleaned.replace("\n\n\n", "\n\n")
+        return cleaned.strip() + ("\n" if cleaned.strip() else "")
+
+    def _upsert_owner_rules(self, content: str, new_rules: list[str]) -> str:
+        merged_rules = self._dedupe_owner_rules([*self.extract_owner_rules(content), *new_rules])
+        base_content = self.strip_owner_rules_section(content).rstrip()
+        if not merged_rules:
+            return base_content + "\n"
+
+        owner_lines = [self.owner_rules_header, *[f"- [OWNER] {rule}" for rule in merged_rules]]
+        lines = base_content.splitlines()
+
+        insert_at = len(lines)
+        for index, line in enumerate(lines):
+            if line.startswith("## "):
+                insert_at = index
+                break
+
+        before = lines[:insert_at]
+        after = lines[insert_at:]
+        rebuilt: list[str] = [*before]
+        if rebuilt and rebuilt[-1] != "":
+            rebuilt.append("")
+        rebuilt.extend(owner_lines)
+        if after:
+            rebuilt.append("")
+            rebuilt.extend(after)
+        return "\n".join(rebuilt).rstrip() + "\n"
+
+    @staticmethod
+    def _normalize_owner_rule_text(value: str) -> str:
+        text = value.strip()
+        text = text.removeprefix("- ").strip()
+        while text.startswith("[OWNER]"):
+            text = text[len("[OWNER]") :].strip()
+        return text
+
+    @staticmethod
+    def _dedupe_owner_rules(rules: list[str]) -> list[str]:
+        output: list[str] = []
+        seen: set[str] = set()
+        for rule in rules:
+            normalized = rule.strip()
+            if not normalized:
+                continue
+            key = normalized.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            output.append(normalized)
+        return output
