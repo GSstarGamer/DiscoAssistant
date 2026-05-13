@@ -46,8 +46,8 @@
     "merge_max_tokens": 900,
     "temperature": 0.3,
     "system_prompts": {
-      "query_gen": "Generate {max_queries} concise DuckDuckGo search queries that would surface authoritative info about the user's question. Return JSON: {\"queries\": [\"q1\", \"q2\"]}.",
-      "url_pick": "From the search results, pick {min_sites} to {max_sites} URLs most likely to contain a direct answer. Return JSON: {\"urls\": [\"https://...\", \"https://...\"]}.",
+      "query_gen": "Generate {max_queries} concise DuckDuckGo search queries that would surface authoritative info about the user's question. Return JSON: {{\"queries\": [\"q1\", \"q2\"]}}.",
+      "url_pick": "From the search results, pick {min_sites} to {max_sites} URLs most likely to contain a direct answer. Return JSON: {{\"urls\": [\"https://...\", \"https://...\"]}}.",
       "summarize": "Read the page content and write a focused summary that directly addresses the user's question. Cite specific facts. Keep it tight.",
       "merge": "Compare the per-site summaries below. Produce one solid final answer for the original question. Note disagreements if any."
     }
