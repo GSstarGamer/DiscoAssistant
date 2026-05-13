@@ -19,7 +19,6 @@ import discord
 from discoassistant.config import BASE_DIR, AppConfig, load_app_config
 from discoassistant.dm_history import DmHistoryStore
 from discoassistant.memory import GuildMemoryStore, UserMemoryStore
-from discoassistant.passive_guild_history import PassiveGuildHistoryStore
 from discoassistant.web_search import run_web_search
 
 
@@ -43,14 +42,6 @@ class PendingReply:
     messages: list[discord.Message] = field(default_factory=list)
 
 
-@dataclass(slots=True)
-class PendingPassiveFlushConfirmation:
-    guild_id: int
-    requester_user_id: int
-    pending_message_count: int
-    expires_at: float
-
-
 class DiscoAssistant(discord.Client):
     def __init__(self, app_config: AppConfig) -> None:
         super().__init__()
@@ -66,9 +57,6 @@ class DiscoAssistant(discord.Client):
         self._session_total_tokens_used = 0
         self._presence_update_task: asyncio.Task[None] | None = None
         self._presence_refresh_requested = False
-        self._passive_guild_poller_task: asyncio.Task[None] | None = None
-        self._passive_guild_summary_tasks: dict[int, asyncio.Task[None]] = {}
-        self._pending_passive_flush_confirmations: dict[tuple[int, int], PendingPassiveFlushConfirmation] = {}
         self.user_memory_store = UserMemoryStore(
             base_dir=BASE_DIR / self.app_config.runtime.memory.user_directory,
             max_chars_in_prompt=self.app_config.runtime.memory.max_user_chars_in_prompt,
@@ -79,9 +67,6 @@ class DiscoAssistant(discord.Client):
         )
         self.dm_history_store = DmHistoryStore(
             db_path=BASE_DIR / self.app_config.runtime.memory.dm_history_db_path,
-        )
-        self.passive_guild_history_store = PassiveGuildHistoryStore(
-            db_path=BASE_DIR / self.app_config.runtime.passive_guild_memory.db_path,
         )
 
     async def setup_hook(self) -> None:
@@ -103,7 +88,6 @@ class DiscoAssistant(discord.Client):
 
     async def on_ready(self) -> None:
         await self._apply_configured_presence()
-        self._ensure_passive_guild_poller()
 
         if self._startup_announced:
             LOGGER.info("Reconnected as %s (%s)", self.user, self.user.id if self.user else "unknown")
@@ -266,679 +250,6 @@ class DiscoAssistant(discord.Client):
         finally:
             self._presence_update_task = None
 
-    def _ensure_passive_guild_poller(self) -> None:
-        passive_config = self.app_config.runtime.passive_guild_memory
-        if not passive_config.enabled:
-            return
-        if self._passive_guild_poller_task is not None and not self._passive_guild_poller_task.done():
-            return
-        self._passive_guild_poller_task = asyncio.create_task(self._passive_guild_poller_loop())
-
-    async def _passive_guild_poller_loop(self) -> None:
-        poll_interval = max(5, self.app_config.runtime.passive_guild_memory.poll_interval_seconds)
-        try:
-            while not self.is_closed():
-                try:
-                    await self._scan_passive_guild_memory()
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    LOGGER.exception("Passive guild memory scan failed.")
-                await asyncio.sleep(poll_interval)
-        except asyncio.CancelledError:
-            raise
-        finally:
-            self._passive_guild_poller_task = None
-
-    async def _scan_passive_guild_memory(self) -> None:
-        enabled_guild_ids = self.app_config.runtime.passive_guild_memory.enabled_guild_ids
-        guild_ids = self.passive_guild_history_store.list_guild_ids_with_pending_messages(
-            enabled_guild_ids=enabled_guild_ids,
-        )
-        for guild_id in guild_ids:
-            await self._maybe_start_passive_guild_summary_for_guild(guild_id)
-
-    async def _maybe_start_passive_guild_summary_for_guild(self, guild_id: int) -> None:
-        if not self._passive_guild_enabled_for_guild(guild_id):
-            return
-
-        running_task = self._passive_guild_summary_tasks.get(guild_id)
-        if running_task is not None and not running_task.done():
-            return
-
-        rows = self.passive_guild_history_store.read_batch_for_guild(guild_id=guild_id)
-        if not rows:
-            return
-
-        current_memory = self.guild_memory_store.read_for_guild(guild_id)
-        estimated_tokens = self._estimate_passive_guild_prompt_tokens(
-            guild_id=guild_id,
-            guild_name=self._latest_guild_name(guild_id, rows),
-            current_memory=current_memory,
-            rows=rows,
-        )
-        if estimated_tokens < self._passive_guild_flush_threshold_tokens():
-            return
-
-        self._passive_guild_summary_tasks[guild_id] = asyncio.create_task(
-            self._run_passive_guild_summary(guild_id)
-        )
-
-    async def _run_passive_guild_summary(self, guild_id: int, *, force: bool = False) -> dict[str, Any]:
-        try:
-            rows = self.passive_guild_history_store.read_batch_for_guild(guild_id=guild_id)
-            if not rows:
-                return {
-                    "ok": True,
-                    "guild_id": guild_id,
-                    "status": "no_pending_rows",
-                    "messages_processed": 0,
-                }
-
-            guild_name = self._latest_guild_name(guild_id, rows)
-            current_memory = self.guild_memory_store.read_for_guild(guild_id)
-            summarizer_memory = self.guild_memory_store.strip_owner_rules_section(current_memory).strip()
-            if (
-                not force
-                and self._estimate_passive_guild_prompt_tokens(
-                    guild_id=guild_id,
-                    guild_name=guild_name,
-                    current_memory=summarizer_memory,
-                    rows=rows,
-                ) < self._passive_guild_flush_threshold_tokens()
-            ):
-                return {
-                    "ok": True,
-                    "guild_id": guild_id,
-                    "status": "below_threshold",
-                    "messages_processed": 0,
-                }
-
-            selected_rows = self._select_passive_guild_rows_for_flush(
-                guild_id=guild_id,
-                guild_name=guild_name,
-                current_memory=summarizer_memory,
-                rows=rows,
-            )
-            if not selected_rows:
-                return {
-                    "ok": False,
-                    "guild_id": guild_id,
-                    "status": "selection_failed",
-                    "messages_processed": 0,
-                    "error_message": "Passive flush could not select any rows for summarization.",
-                }
-
-            summary_payload = await self._summarize_passive_guild_rows(
-                guild_id=guild_id,
-                guild_name=guild_name,
-                current_memory=summarizer_memory,
-                rows=selected_rows,
-            )
-            rendered_memory = self._render_passive_guild_memory_snapshot(
-                guild_id=guild_id,
-                guild_name=guild_name,
-                summary_payload=summary_payload,
-            )
-            self.guild_memory_store.write_for_guild(
-                guild_id=guild_id,
-                content=rendered_memory,
-            )
-            await self._notify_owner_of_guild_memory_update(
-                guild_id=guild_id,
-                guild_name=guild_name,
-                summary=self._passive_guild_owner_summary(summary_payload),
-            )
-            self.passive_guild_history_store.delete_messages_through_row_id(
-                guild_id=guild_id,
-                max_row_id=int(selected_rows[-1]["row_id"]),
-            )
-            LOGGER.info(
-                "Passive guild memory updated guild_id=%s messages=%s",
-                guild_id,
-                len(selected_rows),
-            )
-            return {
-                "ok": True,
-                "guild_id": guild_id,
-                "status": "updated",
-                "messages_processed": len(selected_rows),
-                "last_processed_row_id": int(selected_rows[-1]["row_id"]),
-            }
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            LOGGER.exception("Passive guild summarization failed guild_id=%s", guild_id)
-            return {
-                "ok": False,
-                "guild_id": guild_id,
-                "status": "failed",
-                "messages_processed": 0,
-                "error_type": type(exc).__name__,
-                "error_message": str(exc),
-            }
-        finally:
-            current_task = self._passive_guild_summary_tasks.get(guild_id)
-            if current_task is asyncio.current_task():
-                self._passive_guild_summary_tasks.pop(guild_id, None)
-
-    async def _flush_passive_guild_memory_now(self, guild_id: int) -> dict[str, Any]:
-        total_processed = 0
-        iterations = 0
-        max_iterations = 50
-
-        while iterations < max_iterations:
-            iterations += 1
-            running_task = self._passive_guild_summary_tasks.get(guild_id)
-            if running_task is not None and not running_task.done():
-                result = await running_task
-            else:
-                result = await self._run_passive_guild_summary(guild_id, force=True)
-
-            processed = int(result.get("messages_processed", 0) or 0)
-            total_processed += processed
-            pending_rows = self.passive_guild_history_store.read_batch_for_guild(guild_id=guild_id)
-
-            if result.get("ok") is False:
-                return {
-                    "ok": False,
-                    "guild_id": guild_id,
-                    "status": "failed",
-                    "iterations": iterations,
-                    "messages_processed": total_processed,
-                    "pending_message_count": len(pending_rows),
-                    "error_type": result.get("error_type"),
-                    "error_message": result.get("error_message", "Passive flush failed."),
-                }
-
-            if not pending_rows:
-                return {
-                    "ok": True,
-                    "guild_id": guild_id,
-                    "status": "flushed",
-                    "iterations": iterations,
-                    "messages_processed": total_processed,
-                    "pending_message_count": 0,
-                }
-
-            if processed <= 0:
-                return {
-                    "ok": False,
-                    "guild_id": guild_id,
-                    "status": "stalled",
-                    "iterations": iterations,
-                    "messages_processed": total_processed,
-                    "pending_message_count": len(pending_rows),
-                    "error_message": "Passive flush made no progress while messages still remained queued.",
-                }
-
-        pending_rows = self.passive_guild_history_store.read_batch_for_guild(guild_id=guild_id)
-        return {
-            "ok": False,
-            "guild_id": guild_id,
-            "status": "iteration_limit",
-            "iterations": iterations,
-            "messages_processed": total_processed,
-            "pending_message_count": len(pending_rows),
-            "error_message": "Passive flush hit iteration limit before draining the queue.",
-        }
-
-    def _pending_passive_guild_message_count(self, guild_id: int) -> int:
-        return len(self.passive_guild_history_store.read_batch_for_guild(guild_id=guild_id))
-
-    def _register_passive_flush_confirmation(
-        self,
-        *,
-        guild_id: int,
-        requester_user_id: int,
-        pending_message_count: int,
-    ) -> None:
-        self._pending_passive_flush_confirmations[(guild_id, requester_user_id)] = PendingPassiveFlushConfirmation(
-            guild_id=guild_id,
-            requester_user_id=requester_user_id,
-            pending_message_count=pending_message_count,
-            expires_at=monotonic() + 300,
-        )
-
-    def _consume_passive_flush_confirmation(
-        self,
-        *,
-        guild_id: int,
-        requester_user_id: int,
-    ) -> PendingPassiveFlushConfirmation | None:
-        key = (guild_id, requester_user_id)
-        confirmation = self._pending_passive_flush_confirmations.get(key)
-        if confirmation is None:
-            return None
-        if monotonic() > confirmation.expires_at:
-            self._pending_passive_flush_confirmations.pop(key, None)
-            return None
-        self._pending_passive_flush_confirmations.pop(key, None)
-        return confirmation
-
-    def _peek_passive_flush_confirmation(
-        self,
-        *,
-        guild_id: int,
-        requester_user_id: int,
-    ) -> PendingPassiveFlushConfirmation | None:
-        key = (guild_id, requester_user_id)
-        confirmation = self._pending_passive_flush_confirmations.get(key)
-        if confirmation is None:
-            return None
-        if monotonic() > confirmation.expires_at:
-            self._pending_passive_flush_confirmations.pop(key, None)
-            return None
-        return confirmation
-
-    def _discard_passive_flush_confirmation(
-        self,
-        *,
-        guild_id: int,
-        requester_user_id: int,
-    ) -> bool:
-        key = (guild_id, requester_user_id)
-        return self._pending_passive_flush_confirmations.pop(key, None) is not None
-
-    def _has_pending_passive_flush_confirmation_for_message(self, message: discord.Message) -> bool:
-        if message.guild is None:
-            return False
-        return (
-            self._peek_passive_flush_confirmation(
-                guild_id=message.guild.id,
-                requester_user_id=message.author.id,
-            )
-            is not None
-        )
-
-    def _passive_flush_confirmation_context_for_message(self, message: discord.Message) -> str:
-        if message.guild is None:
-            return ""
-        confirmation = self._peek_passive_flush_confirmation(
-            guild_id=message.guild.id,
-            requester_user_id=message.author.id,
-        )
-        if confirmation is None:
-            return ""
-        return (
-            "Pending passive server-memory flush confirmation is active.\n"
-            f"- guild_id: {confirmation.guild_id}\n"
-            f"- queued_message_count: {confirmation.pending_message_count}\n"
-            "- If the owner confirms, call passive_flush(action='confirm').\n"
-            "- If the owner declines, call passive_flush(action='cancel').\n"
-            "- Do not preview again while this confirmation is active.\n"
-        )
-
-    def _passive_guild_enabled_for_guild(self, guild_id: int) -> bool:
-        passive_config = self.app_config.runtime.passive_guild_memory
-        if not passive_config.enabled:
-            return False
-        if passive_config.enabled_guild_ids is None:
-            return True
-        return guild_id in passive_config.enabled_guild_ids
-
-    def _passive_guild_flush_threshold_tokens(self) -> int:
-        passive_config = self.app_config.runtime.passive_guild_memory
-        return max(1024, int(passive_config.effective_context_limit_tokens * passive_config.flush_ratio))
-
-    def _estimate_passive_guild_prompt_tokens(
-        self,
-        *,
-        guild_id: int,
-        guild_name: str,
-        current_memory: str,
-        rows: list[dict[str, Any]],
-    ) -> int:
-        passive_config = self.app_config.runtime.passive_guild_memory
-        prompt_text = self._passive_guild_summary_prompt_text(
-            guild_id=guild_id,
-            guild_name=guild_name,
-            current_memory=current_memory,
-            rows=rows,
-        )
-        return (len(prompt_text) // 4) + passive_config.max_output_tokens
-
-    def _select_passive_guild_rows_for_flush(
-        self,
-        *,
-        guild_id: int,
-        guild_name: str,
-        current_memory: str,
-        rows: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        passive_config = self.app_config.runtime.passive_guild_memory
-        prompt_budget_tokens = max(
-            1024,
-            self._passive_guild_flush_threshold_tokens() - passive_config.max_output_tokens,
-        )
-        prompt_budget_chars = prompt_budget_tokens * 4
-        base_chars = len(
-            self._passive_guild_summary_prompt_text(
-                guild_id=guild_id,
-                guild_name=guild_name,
-                current_memory=current_memory,
-                rows=[],
-            )
-        )
-
-        selected_rows: list[dict[str, Any]] = []
-        active_channel_id: int | None = None
-        current_chars = base_chars
-        for row in rows:
-            channel_header = ""
-            if row["channel_id"] != active_channel_id:
-                channel_name = row.get("channel_name") or f"channel-{row['channel_id']}"
-                channel_header = f"\n## Channel: {channel_name} ({row['channel_id']})\n"
-
-            row_line = self._passive_guild_row_text(row)
-            projected_chars = current_chars + len(channel_header) + len(row_line)
-            if selected_rows and projected_chars > prompt_budget_chars:
-                break
-
-            selected_rows.append(row)
-            current_chars = projected_chars
-            active_channel_id = int(row["channel_id"])
-
-        if not selected_rows and rows:
-            return [rows[0]]
-        return selected_rows
-
-    async def _summarize_passive_guild_rows(
-        self,
-        *,
-        guild_id: int,
-        guild_name: str,
-        current_memory: str,
-        rows: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        passive_config = self.app_config.runtime.passive_guild_memory
-        models = [passive_config.primary_model]
-        if passive_config.fallback_model and passive_config.fallback_model not in models:
-            models.append(passive_config.fallback_model)
-
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You maintain long-term guild memory for a Discord assistant.\n"
-                    "You receive existing guild memory plus a chronological batch of new messages.\n"
-                    "Revise memory carefully: preserve useful old facts, remove stale claims, merge duplicates, and add new useful observations.\n"
-                    "Capture guild-level norms, channel habits, recurring topics, jokes, relationships, interaction styles, and lightweight observable member traits.\n"
-                    "Allowed member traits are only observable behavior such as talkative, kind, likes certain topics, often helps, often jokes, recurring habits, preferred level of detail, or recognizable communication style.\n"
-                    "Prefer small reusable cues that would help future replies land better, not just major facts.\n"
-                    "Do not infer sensitive traits or hidden attributes.\n"
-                    "Return strict JSON only with keys guild_notes, channel_notes, member_notes.\n"
-                    "Each key must map to a list.\n"
-                    "channel_notes items must contain channel_id, channel_name, notes.\n"
-                    "member_notes items must contain user_id, username, notes."
-                ),
-            },
-            {
-                "role": "user",
-                "content": self._passive_guild_summary_prompt_text(
-                    guild_id=guild_id,
-                    guild_name=guild_name,
-                    current_memory=current_memory,
-                    rows=rows,
-                ),
-            },
-        ]
-
-        last_error: Exception | None = None
-        for model in models:
-            try:
-                response = await self.openrouter_chat(
-                    model=model,
-                    messages=messages,
-                    extra_payload={
-                        "temperature": passive_config.temperature,
-                        "max_tokens": passive_config.max_output_tokens,
-                    },
-                    max_attempts=1,
-                )
-                text = self.extract_response_text(response, messages=messages)
-                return self._parse_passive_guild_summary_json(text)
-            except Exception as exc:
-                last_error = exc
-                LOGGER.warning(
-                    "Passive guild summarizer failed model=%s guild_id=%s error=%s",
-                    model,
-                    guild_id,
-                    exc,
-                )
-
-        if last_error is not None:
-            raise last_error
-        raise RuntimeError("Passive guild summarizer failed without a captured exception.")
-
-    def _passive_guild_summary_prompt_text(
-        self,
-        *,
-        guild_id: int,
-        guild_name: str,
-        current_memory: str,
-        rows: list[dict[str, Any]],
-    ) -> str:
-        memory_text = current_memory.strip() or "(none)"
-        messages_text = self._serialize_passive_guild_rows(rows).strip() or "(no messages)"
-        return (
-            f"Guild ID: {guild_id}\n"
-            f"Guild name: {guild_name}\n\n"
-            "Current guild memory:\n"
-            f"{memory_text}\n\n"
-            "New raw guild messages, grouped by channel:\n"
-            f"{messages_text}\n"
-        )
-
-    def _serialize_passive_guild_rows(self, rows: list[dict[str, Any]]) -> str:
-        if not rows:
-            return ""
-
-        lines: list[str] = []
-        active_channel_id: int | None = None
-        for row in rows:
-            channel_id = int(row["channel_id"])
-            if channel_id != active_channel_id:
-                channel_name = row.get("channel_name") or f"channel-{channel_id}"
-                lines.append(f"## Channel: {channel_name} ({channel_id})")
-                active_channel_id = channel_id
-            lines.append(self._passive_guild_row_text(row).rstrip())
-        return "\n".join(lines)
-
-    @staticmethod
-    def _passive_guild_row_text(row: dict[str, Any]) -> str:
-        created_at = row.get("created_at") or "unknown-time"
-        author_username = row.get("author_username") or "unknown-user"
-        author_id = row.get("author_id")
-        content = row.get("content") or ""
-        return f"- [{created_at}] {author_username} ({author_id}): {content}\n"
-
-    def _parse_passive_guild_summary_json(self, text: str) -> dict[str, Any]:
-        candidate_texts = [text.strip()]
-        stripped = text.strip()
-        if stripped.startswith("```"):
-            stripped = stripped.strip("`")
-            if stripped.startswith("json"):
-                stripped = stripped[4:].lstrip()
-            candidate_texts.append(stripped)
-        first_brace = text.find("{")
-        last_brace = text.rfind("}")
-        if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
-            candidate_texts.append(text[first_brace : last_brace + 1].strip())
-
-        parsed: dict[str, Any] | None = None
-        for candidate in candidate_texts:
-            if not candidate:
-                continue
-            try:
-                value = json.loads(candidate)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict):
-                parsed = value
-                break
-
-        if parsed is None:
-            raise ValueError("Passive guild summarizer did not return valid JSON.")
-
-        guild_notes = parsed.get("guild_notes")
-        channel_notes = parsed.get("channel_notes")
-        member_notes = parsed.get("member_notes")
-        if not isinstance(guild_notes, list) or not isinstance(channel_notes, list) or not isinstance(member_notes, list):
-            raise ValueError("Passive guild summary JSON is missing required list keys.")
-
-        return {
-            "guild_notes": self._normalize_passive_summary_notes(guild_notes),
-            "channel_notes": [
-                {
-                    "channel_id": int(item.get("channel_id")),
-                    "channel_name": str(item.get("channel_name", "")).strip() or f"channel-{item.get('channel_id')}",
-                    "notes": self._normalize_passive_summary_notes(item.get("notes", [])),
-                }
-                for item in channel_notes
-                if isinstance(item, dict) and item.get("channel_id") is not None
-            ],
-            "member_notes": [
-                {
-                    "user_id": int(item.get("user_id")),
-                    "username": str(item.get("username", "")).strip() or f"user-{item.get('user_id')}",
-                    "notes": self._normalize_passive_summary_notes(item.get("notes", [])),
-                }
-                for item in member_notes
-                if isinstance(item, dict) and item.get("user_id") is not None
-            ],
-        }
-
-    @staticmethod
-    def _normalize_passive_summary_notes(raw_notes: Any) -> list[str]:
-        if isinstance(raw_notes, str):
-            note = raw_notes.strip()
-            return [note] if note else []
-        if not isinstance(raw_notes, list):
-            return []
-        return [str(item).strip() for item in raw_notes if str(item).strip()]
-
-    def _render_passive_guild_memory_snapshot(
-        self,
-        *,
-        guild_id: int,
-        guild_name: str,
-        summary_payload: dict[str, Any],
-    ) -> str:
-        lines = [
-            f"# Server Memory: {guild_id}",
-            "",
-            f"- Guild ID: {guild_id}",
-            f"- Last known guild name: {guild_name}",
-            "",
-            "## Guild Notes",
-        ]
-
-        guild_notes = summary_payload.get("guild_notes", [])
-        if guild_notes:
-            for note in guild_notes:
-                lines.append(f"- {note}")
-        else:
-            lines.append("- (none)")
-
-        lines.extend(["", "## Channel Notes"])
-        channel_notes = summary_payload.get("channel_notes", [])
-        if channel_notes:
-            for item in channel_notes:
-                lines.append(f"### {item['channel_name']} ({item['channel_id']})")
-                if item["notes"]:
-                    for note in item["notes"]:
-                        lines.append(f"- {note}")
-                else:
-                    lines.append("- (none)")
-        else:
-            lines.append("- (none)")
-
-        lines.extend(["", "## Member Notes"])
-        member_notes = summary_payload.get("member_notes", [])
-        if member_notes:
-            for item in member_notes:
-                lines.append(f"### {item['username']} ({item['user_id']})")
-                if item["notes"]:
-                    for note in item["notes"]:
-                        lines.append(f"- {note}")
-                else:
-                    lines.append("- (none)")
-        else:
-            lines.append("- (none)")
-
-        return "\n".join(lines)
-
-    def _passive_guild_owner_summary(self, summary_payload: dict[str, Any]) -> str:
-        lines: list[str] = []
-
-        guild_notes = summary_payload.get("guild_notes", [])
-        if guild_notes:
-            lines.append("Guild notes:")
-            for note in guild_notes[:3]:
-                lines.append(f"- {note}")
-
-        channel_notes = summary_payload.get("channel_notes", [])
-        if channel_notes:
-            lines.append("Channel notes:")
-            for item in channel_notes[:2]:
-                channel_name = item.get("channel_name") or item.get("channel_id")
-                note_list = item.get("notes", [])
-                if note_list:
-                    lines.append(f"- {channel_name}: {note_list[0]}")
-
-        member_notes = summary_payload.get("member_notes", [])
-        if member_notes:
-            lines.append("Member notes:")
-            for item in member_notes[:3]:
-                username = item.get("username") or item.get("user_id")
-                note_list = item.get("notes", [])
-                if note_list:
-                    lines.append(f"- {username}: {note_list[0]}")
-
-        if not lines:
-            return "Memory snapshot updated, but there were no non-empty summary notes."
-        return "\n".join(lines)
-
-    def _latest_guild_name(self, guild_id: int, rows: list[dict[str, Any]]) -> str:
-        guild = self.get_guild(guild_id)
-        if guild is not None and getattr(guild, "name", None):
-            return guild.name
-        for row in reversed(rows):
-            guild_name = str(row.get("guild_name") or "").strip()
-            if guild_name:
-                return guild_name
-        return "unknown"
-
-    def _store_passive_guild_message(self, message: discord.Message) -> None:
-        if message.guild is None:
-            return
-        if not self._passive_guild_enabled_for_guild(message.guild.id):
-            return
-
-        content = self._passive_guild_content_for_message(message)
-        if not content:
-            return
-
-        self.passive_guild_history_store.append_message(
-            guild_id=message.guild.id,
-            guild_name=message.guild.name,
-            channel_id=message.channel.id,
-            channel_name=getattr(message.channel, "name", None),
-            author_id=message.author.id,
-            author_username=getattr(message.author, "name", str(message.author)),
-            content=content,
-            discord_message_id=message.id,
-            created_at=message.created_at.isoformat() if message.created_at else None,
-        )
-        running_task = self._passive_guild_summary_tasks.get(message.guild.id)
-        if running_task is None or running_task.done():
-            asyncio.create_task(self._maybe_start_passive_guild_summary_for_guild(message.guild.id))
-
-    @staticmethod
-    def _passive_guild_content_for_message(message: discord.Message) -> str:
-        return DiscoAssistant._message_text_for_context(message)
-
     @staticmethod
     def _message_text_for_context(message: discord.Message) -> str:
         parts: list[str] = []
@@ -993,12 +304,11 @@ class DiscoAssistant(discord.Client):
         return "\n\n".join(rendered_embeds).strip()
 
     async def on_message(self, message: discord.Message) -> None:
-        self._append_passive_channel_context(message)
+        self._append_sibling_channel_context(message)
 
         if not self._should_consider_message(message):
             return
 
-        self._store_passive_guild_message(message)
         self._store_incoming_dm_message(message)
 
         is_direct_mention = self._should_respond_to_message(message)
@@ -1027,11 +337,6 @@ class DiscoAssistant(discord.Client):
         for task in self._reply_tasks.values():
             if not task.done():
                 task.cancel()
-        for task in self._passive_guild_summary_tasks.values():
-            if not task.done():
-                task.cancel()
-        if self._passive_guild_poller_task is not None and not self._passive_guild_poller_task.done():
-            self._passive_guild_poller_task.cancel()
         if self._presence_update_task is not None and not self._presence_update_task.done():
             self._presence_update_task.cancel()
         if self.http_session is not None and not self.http_session.closed:
@@ -1192,7 +497,6 @@ class DiscoAssistant(discord.Client):
         server_memory_context = self._server_memory_context_for_message(message)
         pending_burst_context = self._pending_burst_context(pending_messages, latest_message_id=message.id)
         reply_reference_context = await self._reply_reference_context(message)
-        passive_flush_confirmation_context = self._passive_flush_confirmation_context_for_message(message)
 
         messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
         if self._is_direct_message(message):
@@ -1244,7 +548,6 @@ class DiscoAssistant(discord.Client):
                     f"{pending_burst_context}"
                     f"{memory_context}"
                     f"{server_memory_context}"
-                    f"{passive_flush_confirmation_context}"
                     f"{prefetched_channel_context}"
                     "Keep it short."
                 ),
@@ -1370,12 +673,6 @@ class DiscoAssistant(discord.Client):
             pending_messages = pending.messages if pending is not None else [message]
             should_respond = self._should_respond_to_message(message)
             had_active_conversation = self._has_active_conversation(message)
-            if not should_respond and self._has_pending_passive_flush_confirmation_for_message(message):
-                LOGGER.info(
-                    "reply task treating message_id=%s as passive flush confirmation follow-up",
-                    message.id,
-                )
-                should_respond = True
             if not should_respond and pending is not None and pending.started_from_mention:
                 LOGGER.info("reply task treating key=%s message_id=%s as pending mention follow-up", key, message.id)
                 should_respond = True
@@ -2027,8 +1324,6 @@ class DiscoAssistant(discord.Client):
             result = await self._tool_edit_memory(arguments, tool_context)
         elif function_name == "read_user_memory":
             result = await self._tool_read_user_memory(arguments, tool_context)
-        elif function_name == "passive_flush":
-            result = await self._tool_passive_flush(arguments, tool_context)
         elif function_name == "send_dm":
             result = await self._tool_send_dm(arguments, tool_context)
         elif function_name == "web_search":
@@ -2352,69 +1647,6 @@ class DiscoAssistant(discord.Client):
                 "pronouns": getattr(metadata, "pronouns", None),
                 "banner_url": str(metadata.banner.url) if getattr(metadata, "banner", None) is not None else None,
             }
-        return result
-
-    async def _tool_passive_flush(
-        self,
-        arguments: dict[str, Any],
-        tool_context: dict[str, Any],
-    ) -> dict[str, Any]:
-        message: discord.Message = tool_context["message"]
-        self._require_owner(message, "passive_flush")
-        action = str(arguments.get("action", "")).strip().lower()
-        if action not in {"preview", "confirm", "cancel"}:
-            raise ValueError("passive_flush.action must be 'preview', 'confirm', or 'cancel'.")
-
-        if message.guild is None and arguments.get("guild_id") is None:
-            raise ValueError("passive_flush requires a guild/server channel or explicit guild_id.")
-        guild_id = int(arguments["guild_id"]) if arguments.get("guild_id") is not None else message.guild.id
-        guild_name = message.guild.name if message.guild is not None else None
-
-        if action == "preview":
-            pending_count = self._pending_passive_guild_message_count(guild_id)
-            self._register_passive_flush_confirmation(
-                guild_id=guild_id,
-                requester_user_id=message.author.id,
-                pending_message_count=pending_count,
-            )
-            return {
-                "ok": True,
-                "action": "preview",
-                "guild_id": guild_id,
-                "guild_name": guild_name,
-                "pending_message_count": pending_count,
-                "confirmation_required": True,
-                "confirmation_window_seconds": 300,
-                "status": "preview_ready",
-            }
-
-        if action == "cancel":
-            cancelled = self._discard_passive_flush_confirmation(
-                guild_id=guild_id,
-                requester_user_id=message.author.id,
-            )
-            return {
-                "ok": cancelled,
-                "action": "cancel",
-                "guild_id": guild_id,
-                "guild_name": guild_name,
-                "status": "cancelled" if cancelled else "no_pending_confirmation",
-            }
-
-        # action == "confirm"
-        confirmation = self._consume_passive_flush_confirmation(
-            guild_id=guild_id,
-            requester_user_id=message.author.id,
-        )
-        if confirmation is None:
-            raise ValueError(
-                "Preview required before confirm. Call passive_flush(action='preview') first, tell the user how many messages are queued, and only confirm after they explicitly say yes."
-            )
-        if not self._passive_guild_enabled_for_guild(guild_id):
-            raise ValueError(f"Passive guild memory is not enabled for guild_id={guild_id}.")
-        result = await self._flush_passive_guild_memory_now(guild_id)
-        result["action"] = "confirm"
-        result["preview_pending_message_count"] = confirmation.pending_message_count
         return result
 
     async def _tool_send_dm(
@@ -2845,38 +2077,6 @@ class DiscoAssistant(discord.Client):
                 }
             )
 
-        if "passive_flush" in allowed:
-            schemas.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "passive_flush",
-                        "description": (
-                            "Owner-only. Manage the passive server-memory queue for the current guild. "
-                            "action='preview' shows how many messages are queued and starts a confirmation window — call this first. "
-                            "action='confirm' summarizes the queue into server memory; only call after preview AND explicit owner yes in the same turn-pair. "
-                            "action='cancel' discards a pending confirmation when the owner says no."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "action": {
-                                    "type": "string",
-                                    "enum": ["preview", "confirm", "cancel"],
-                                    "description": "Step of the flush workflow.",
-                                },
-                                "guild_id": {
-                                    "type": "integer",
-                                    "description": "Optional explicit guild id. Omit in a server channel to use the current guild.",
-                                },
-                            },
-                            "required": ["action"],
-                            "additionalProperties": False,
-                        },
-                    },
-                }
-            )
-
         if "send_dm" in allowed:
             schemas.append(
                 {
@@ -3011,29 +2211,7 @@ class DiscoAssistant(discord.Client):
             keys.append(key)
         return keys
 
-    def _store_active_conversation(
-        self,
-        *,
-        message: discord.Message,
-        prior_conversation: ActiveConversation | None,
-        user_message: dict[str, str],
-        assistant_reply: str,
-    ) -> None:
-        conversation_messages: list[dict[str, str]] = []
-        if prior_conversation is not None:
-            conversation_messages.extend(prior_conversation.messages)
-
-        conversation_messages.append(user_message)
-        conversation_messages.append({"role": "assistant", "content": assistant_reply})
-        conversation_messages = conversation_messages[-12:]
-
-        self._active_conversations[self._conversation_key(message)] = ActiveConversation(
-            messages=conversation_messages,
-            expires_at=monotonic() + self.app_config.runtime.discord.conversation_window_seconds,
-            interrupted_by_other_user=False,
-        )
-
-    def _append_passive_channel_context(self, message: discord.Message) -> None:
+    def _append_sibling_channel_context(self, message: discord.Message) -> None:
         if self.user is None:
             return
 
@@ -3067,6 +2245,28 @@ class DiscoAssistant(discord.Client):
             conversation.messages = conversation.messages[-12:]
             conversation.expires_at = monotonic() + self.app_config.runtime.discord.conversation_window_seconds
             conversation.interrupted_by_other_user = True
+
+    def _store_active_conversation(
+        self,
+        *,
+        message: discord.Message,
+        prior_conversation: ActiveConversation | None,
+        user_message: dict[str, str],
+        assistant_reply: str,
+    ) -> None:
+        conversation_messages: list[dict[str, str]] = []
+        if prior_conversation is not None:
+            conversation_messages.extend(prior_conversation.messages)
+
+        conversation_messages.append(user_message)
+        conversation_messages.append({"role": "assistant", "content": assistant_reply})
+        conversation_messages = conversation_messages[-12:]
+
+        self._active_conversations[self._conversation_key(message)] = ActiveConversation(
+            messages=conversation_messages,
+            expires_at=monotonic() + self.app_config.runtime.discord.conversation_window_seconds,
+            interrupted_by_other_user=False,
+        )
 
     @staticmethod
     def _conversation_key(message: discord.Message) -> tuple[int, int]:
