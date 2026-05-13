@@ -9,6 +9,7 @@ from discoassistant.llm.tools import (
     replace_in_memory,
     send_dm,
     server_log,
+    web_search,
 )
 
 
@@ -23,6 +24,7 @@ _DEFAULT_TOOL_MODULES = (
     read_user_memory,
     server_log,
     send_dm,
+    web_search,
 )
 
 

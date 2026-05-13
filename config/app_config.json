@@ -83,6 +83,11 @@
         "name": "send_dm",
         "description": "Send a direct message. Non-owner may only DM the owner; owner may DM anyone.",
         "enabled": true
+      },
+      {
+        "name": "web_search",
+        "description": "Search the live web for current information using Tavily.",
+        "enabled": true
       }
     ]
   },
@@ -102,7 +107,8 @@
         "replace_in_memory",
         "read_user_memory",
         "server_log",
-        "send_dm"
+        "send_dm",
+        "web_search"
       ],
       "handoff_targets": []
     },
@@ -115,7 +121,8 @@
       "max_output_tokens": 180,
       "tools": [
         "read_channel_messages",
-        "lookup_user"
+        "lookup_user",
+        "web_search"
       ],
       "handoff_targets": []
     }

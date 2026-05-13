@@ -133,6 +133,7 @@ class Settings(BaseSettings):
 
     discord_token: str
     openrouter_api_key: str
+    tavily_api_key: str | None = None
     owner_user_id: int
     app_config_path: Path = DEFAULT_CONFIG_PATH
 

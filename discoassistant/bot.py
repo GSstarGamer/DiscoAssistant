@@ -175,6 +175,10 @@ class DiscoAssistant(discord.Client):
     def user_id(self) -> int | None:
         return self.user.id if self.user is not None else None
 
+    @property
+    def tavily_api_key(self) -> str | None:
+        return self.app_config.settings.tavily_api_key
+
     def display_name_for_message_author(self, message: discord.Message) -> str:
         return self._display_name_for_message_author(message)
 
@@ -908,9 +912,16 @@ class DiscoAssistant(discord.Client):
         return None
 
     async def _prefetch_channel_history_for_message(self, message: discord.Message) -> str:
+        referenced_message = await self._resolve_referenced_message(message)
+        tool_arguments: dict[str, Any] = {}
+        if referenced_message is not None:
+            # When replying to an older message, cap prefetched context at that
+            # target so newer channel chatter does not appear "under" it.
+            tool_arguments["before_message_id"] = referenced_message.id + 1
+
         history_payload = await self.tool_registry.dispatch(
             "read_channel_messages",
-            {},
+            tool_arguments,
             ToolContext(message=message, services=self),
         )
         history_messages = history_payload.get("messages", [])

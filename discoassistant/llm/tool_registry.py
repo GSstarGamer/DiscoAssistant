@@ -27,6 +27,7 @@ class BotServices(Protocol):
     owner_notifier: Any
     owner_user_id: int
     user_id: int | None
+    tavily_api_key: str | None
 
     def display_name_for_message_author(self, message: discord.Message) -> str: ...
 
