@@ -3,7 +3,7 @@
     "respond_to_bots": false,
     "max_history_messages": 20,
     "conversation_window_seconds": 10,
-    "reply_debounce_seconds": 2.5,
+    "reply_debounce_seconds": 1.0,
     "presence": {
       "enabled": true,
       "type": "streaming",
