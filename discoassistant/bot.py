@@ -6,10 +6,12 @@ import logging
 import re
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from time import monotonic
 from typing import Any
 from collections.abc import Iterable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiohttp
 import discord
@@ -1175,6 +1177,7 @@ class DiscoAssistant(discord.Client):
             self.app_config.runtime.prompts.get("memory_rules", ""),
             self.app_config.runtime.prompts.get("safety", ""),
             self._assistant_identity_prompt(),
+            self._current_time_prompt(),
             owner_context_prompt,
             self._owner_only_tools_prompt(selected_agent.name),
             selected_agent.system_prompt,
@@ -2030,6 +2033,8 @@ class DiscoAssistant(discord.Client):
             result = await self._tool_send_dm(arguments, tool_context)
         elif function_name == "web_search":
             result = await self._tool_web_search(arguments, tool_context)
+        elif function_name == "get_time":
+            result = await self._tool_get_time(arguments, tool_context)
         else:
             raise RuntimeError(f"Unsupported tool call: {function_name}")
 
@@ -2487,6 +2492,33 @@ class DiscoAssistant(discord.Client):
             config=cfg,
         )
 
+    async def _tool_get_time(
+        self,
+        arguments: dict[str, Any],
+        tool_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        tz_name = str(arguments.get("timezone", "UTC")).strip() or "UTC"
+        try:
+            tz = ZoneInfo(tz_name)
+        except ZoneInfoNotFoundError:
+            return {
+                "ok": False,
+                "error_type": "bad_timezone",
+                "error_message": (
+                    f"Unknown timezone {tz_name!r}. Use an IANA name like "
+                    "'America/New_York', 'Europe/London', or 'Asia/Tokyo'."
+                ),
+            }
+        now = datetime.now(tz)
+        return {
+            "ok": True,
+            "timezone": tz_name,
+            "iso": now.isoformat(),
+            "human": now.strftime("%A, %B %d, %Y at %I:%M %p"),
+            "utc_offset": now.strftime("%z"),
+            "tz_abbreviation": now.strftime("%Z"),
+        }
+
     def _require_owner(self, message: discord.Message, tool_name: str) -> None:
         if message.author.id != self.app_config.settings.owner_user_id:
             raise ValueError(f"{tool_name} is restricted to the owner.")
@@ -2904,6 +2936,33 @@ class DiscoAssistant(discord.Client):
                 }
             )
 
+        if "get_time" in allowed:
+            schemas.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_time",
+                        "description": (
+                            "Get the exact current time in a specific timezone. "
+                            "Always call this when the user asks for the time anywhere — never guess. "
+                            "Use IANA timezone names like 'America/New_York' (US East), "
+                            "'America/Los_Angeles' (US West), 'Europe/London', 'Asia/Tokyo', 'UTC'."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "timezone": {
+                                    "type": "string",
+                                    "description": "IANA timezone name. Defaults to UTC if omitted.",
+                                },
+                            },
+                            "required": [],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            )
+
         return schemas
 
     def _tool_choice_for_message(self, message: discord.Message) -> str | dict[str, Any]:
@@ -3251,6 +3310,17 @@ class DiscoAssistant(discord.Client):
             f"- owner_user_id: {owner_user_id}\n"
             "- You are this Discord account. Do not confuse yourself with message author or owner.\n"
             "- If user asks who you are, use this identity.\n"
+        )
+
+    def _current_time_prompt(self) -> str:
+        now_utc = datetime.now(timezone.utc)
+        return (
+            "Current time (real clock — do not guess or compute from memory):\n"
+            f"- UTC now: {now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
+            f"- Weekday: {now_utc.strftime('%A')}\n"
+            "If asked for time in a specific timezone, call get_time with an IANA "
+            "name (e.g. 'America/New_York' for US East, 'America/Los_Angeles' for "
+            "US West, 'Europe/London', 'Asia/Tokyo'). Never invent a time."
         )
 
     @staticmethod

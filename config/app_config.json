@@ -108,6 +108,11 @@
         "name": "web_search",
         "description": "Search the live web via a dedicated subagent. Use for current events, recent facts, or anything that needs up-to-date sources.",
         "enabled": true
+      },
+      {
+        "name": "get_time",
+        "description": "Get the exact current time in any IANA timezone. Always use this when asked for the time.",
+        "enabled": true
       }
     ]
   },
@@ -133,7 +138,8 @@
         "edit_memory",
         "read_user_memory",
         "passive_flush",
-        "send_dm"
+        "send_dm",
+        "get_time"
       ],
       "handoff_targets": []
     },
@@ -147,7 +153,8 @@
       "tools": [
         "read_channel",
         "lookup_user",
-        "web_search"
+        "web_search",
+        "get_time"
       ],
       "handoff_targets": []
     }
