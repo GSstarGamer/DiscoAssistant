@@ -38,6 +38,7 @@ class ReplyPromptBuilder:
         agent_for_message: Callable[[discord.Message], Any],
         owner_context_prompt: Callable[[discord.Message], Awaitable[str]],
         assistant_identity_prompt: Callable[[], str],
+        current_time_prompt: Callable[[], str],
         is_direct_message: Callable[[discord.Message], bool],
         is_mention_without_other_text: Callable[[discord.Message], bool],
         get_active_conversation: Callable[[discord.Message], Any],
@@ -64,6 +65,7 @@ class ReplyPromptBuilder:
         self._agent_for_message = agent_for_message
         self._owner_context_prompt = owner_context_prompt
         self._assistant_identity_prompt = assistant_identity_prompt
+        self._current_time_prompt = current_time_prompt
         self._is_direct_message = is_direct_message
         self._is_mention_without_other_text = is_mention_without_other_text
         self._get_active_conversation = get_active_conversation
@@ -133,6 +135,9 @@ class ReplyPromptBuilder:
 
         # System block #3 — per-turn runtime context.
         runtime_lines: list[str] = []
+        current_time = self._current_time_prompt()
+        if current_time:
+            runtime_lines.append(current_time.strip())
         runtime_lines.append(
             f"Author: {self._display_name_for_message_author(message)} "
             f"(username {message.author}, id {message.author.id})"

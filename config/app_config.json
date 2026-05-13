@@ -108,6 +108,11 @@
         "name": "web_search",
         "description": "Search the live web for current information using Tavily.",
         "enabled": true
+      },
+      {
+        "name": "get_time",
+        "description": "Get the exact current time in any IANA timezone. Always use this when asked for the time.",
+        "enabled": true
       }
     ]
   },
@@ -128,7 +133,8 @@
         "read_user_memory",
         "server_log",
         "send_dm",
-        "web_search"
+        "web_search",
+        "get_time"
       ],
       "handoff_targets": []
     },
@@ -142,9 +148,11 @@
       "tools": [
         "read_channel_messages",
         "lookup_user",
-        "web_search"
+        "web_search",
+        "get_time"
       ],
       "handoff_targets": []
     }
   }
 }
+

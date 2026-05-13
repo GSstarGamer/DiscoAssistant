@@ -142,6 +142,7 @@ class DiscoAssistant(discord.Client):
             agent_for_message=self._agent_for_message,
             owner_context_prompt=self._owner_context_prompt,
             assistant_identity_prompt=self._assistant_identity_prompt,
+            current_time_prompt=self._current_time_prompt,
             is_direct_message=self._is_direct_message,
             is_mention_without_other_text=self._is_mention_without_other_text,
             get_active_conversation=self._get_active_conversation,
@@ -896,9 +897,9 @@ class DiscoAssistant(discord.Client):
             "same",
             "aw",
             "aww",
-            "❤️",
-            "🥹",
-            "🤤",
+            "??",
+            "??",
+            "??",
         }
         if lowered in acknowledgement_followups:
             return True
@@ -1457,6 +1458,17 @@ class DiscoAssistant(discord.Client):
         self._assistant_identity_cache = text
         return text
 
+    def _current_time_prompt(self) -> str:
+        now_utc = datetime.now(UTC)
+        return (
+            "Current time (real clock - do not guess or compute from memory):\n"
+            f"- UTC now: {now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
+            f"- Weekday: {now_utc.strftime('%A')}\n"
+            "If asked for time in a specific timezone, call get_time with an IANA "
+            "name (e.g. 'America/New_York' for US East, 'America/Los_Angeles' for "
+            "US West, 'Europe/London', 'Asia/Tokyo'). Never invent a time."
+        )
+
     def _user_from_message_context(
         self,
         message: discord.Message,
@@ -1517,3 +1529,4 @@ def main() -> None:
     app_config = load_app_config()
     bot = DiscoAssistant(app_config)
     bot.run(app_config.settings.discord_token)
+

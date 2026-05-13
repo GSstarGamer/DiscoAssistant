@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from discoassistant.llm.tool_registry import BotServices, ToolRegistry
 from discoassistant.llm.tools import (
+    get_time,
     lookup_user,
     read_channel_messages,
     read_user_memory,
@@ -25,6 +26,7 @@ _DEFAULT_TOOL_MODULES = (
     server_log,
     send_dm,
     web_search,
+    get_time,
 )
 
 
