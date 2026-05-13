@@ -18,6 +18,7 @@ from discoassistant.config import BASE_DIR, AppConfig, load_app_config
 from discoassistant.dm_history import DmHistoryStore
 from discoassistant.memory import GuildMemoryStore, UserMemoryStore
 from discoassistant.passive_guild_history import PassiveGuildHistoryStore
+from discoassistant.web_search import run_web_search
 
 
 LOGGER = logging.getLogger("discoassistant")
@@ -2027,6 +2028,8 @@ class DiscoAssistant(discord.Client):
             result = await self._tool_passive_flush(arguments, tool_context)
         elif function_name == "send_dm":
             result = await self._tool_send_dm(arguments, tool_context)
+        elif function_name == "web_search":
+            result = await self._tool_web_search(arguments, tool_context)
         else:
             raise RuntimeError(f"Unsupported tool call: {function_name}")
 
@@ -2452,6 +2455,38 @@ class DiscoAssistant(discord.Client):
             "sent_content": content,
         }
 
+    async def _tool_web_search(
+        self,
+        arguments: dict[str, Any],
+        tool_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        cfg = self.app_config.runtime.web_search
+        if not cfg.enabled:
+            return {
+                "ok": False,
+                "error_type": "disabled",
+                "error_message": "web_search is disabled in config",
+            }
+        if self.http_session is None:
+            return {
+                "ok": False,
+                "error_type": "no_http_session",
+                "error_message": "HTTP session not ready",
+            }
+        question = str(arguments.get("question", "")).strip()
+        if not question:
+            return {
+                "ok": False,
+                "error_type": "bad_args",
+                "error_message": "web_search.question is required",
+            }
+        return await run_web_search(
+            question=question,
+            openrouter_chat=self.openrouter_chat,
+            http_session=self.http_session,
+            config=cfg,
+        )
+
     def _require_owner(self, message: discord.Message, tool_name: str) -> None:
         if message.author.id != self.app_config.settings.owner_user_id:
             raise ValueError(f"{tool_name} is restricted to the owner.")
@@ -2835,6 +2870,34 @@ class DiscoAssistant(discord.Client):
                                 },
                             },
                             "required": ["target_user_id", "content"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            )
+
+        if "web_search" in allowed:
+            schemas.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "description": (
+                            "Research a question using the live web via a dedicated subagent. "
+                            "The subagent issues DuckDuckGo queries, fetches 2-3 source pages in parallel, "
+                            "summarizes each, then merges them into one grounded answer. "
+                            "Use for current events, recent facts, or anything that needs up-to-date sources. "
+                            "Pass the user's question verbatim or a tight reformulation."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "question": {
+                                    "type": "string",
+                                    "description": "The question or topic to research on the live web.",
+                                },
+                            },
+                            "required": ["question"],
                             "additionalProperties": False,
                         },
                     },
