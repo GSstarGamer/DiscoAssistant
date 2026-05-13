@@ -44,6 +44,26 @@
     "app_name": "DiscoAssistant",
     "site_url": null
   },
+  "web_search": {
+    "enabled": true,
+    "model": "openai/gpt-5-nano",
+    "service_tier": "flex",
+    "max_queries": 2,
+    "min_sites": 2,
+    "max_sites": 3,
+    "ddg_results_per_query": 10,
+    "fetch_timeout_seconds": 12,
+    "max_html_chars": 200000,
+    "summary_max_tokens": 600,
+    "merge_max_tokens": 900,
+    "temperature": 0.3,
+    "system_prompts": {
+      "query_gen": "Generate {max_queries} concise DuckDuckGo search queries that would surface authoritative info about the user's question. Return JSON: {\"queries\": [\"q1\", \"q2\"]}.",
+      "url_pick": "From the search results, pick {min_sites} to {max_sites} URLs most likely to contain a direct answer. Return JSON: {\"urls\": [\"https://...\", \"https://...\"]}.",
+      "summarize": "Read the page content and write a focused summary that directly addresses the user's question. Cite specific facts. Keep it tight.",
+      "merge": "Compare the per-site summaries below. Produce one solid final answer for the original question. Note disagreements if any."
+    }
+  },
   "tool_policy": {
     "allow_model_tool_calls": true,
     "max_calls_per_turn": 6,

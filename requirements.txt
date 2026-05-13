@@ -1,4 +1,7 @@
 aiohttp
+beautifulsoup4
 discord.py-self
+duckduckgo-search
+lxml
 pydantic
 pydantic-settings
