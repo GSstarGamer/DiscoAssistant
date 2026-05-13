@@ -121,6 +121,7 @@
         "edit_memory",
         "read_user_memory",
         "send_dm",
+        "web_search",
         "get_time"
       ],
       "handoff_targets": []
