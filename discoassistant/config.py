@@ -98,12 +98,12 @@ class WebSearchConfig(BaseModel):
             query_gen=(
                 "Generate {max_queries} concise DuckDuckGo search queries that would "
                 "surface authoritative info about the user's question. Return JSON: "
-                '{"queries": ["q1", "q2"]}.'
+                '{{"queries": ["q1", "q2"]}}.'
             ),
             url_pick=(
                 "From the search results, pick {min_sites} to {max_sites} URLs most "
                 "likely to contain a direct answer. Return JSON: "
-                '{"urls": ["https://...", "https://..."]}.'
+                '{{"urls": ["https://...", "https://..."]}}.'
             ),
             summarize=(
                 "Read the page content and write a focused summary that directly "

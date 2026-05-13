@@ -54,7 +54,7 @@
   },
   "tool_policy": {
     "allow_model_tool_calls": true,
-    "max_calls_per_turn": 12,
+    "max_calls_per_turn": 5,
     "timeout_seconds": 30,
     "registry": [
       {
