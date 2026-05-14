@@ -1,7 +1,7 @@
 aiohttp
 beautifulsoup4
 discord.py-self
-duckduckgo-search
+# Tavily search via HTTP — no SDK needed
 lxml
 pydantic
 pydantic-settings

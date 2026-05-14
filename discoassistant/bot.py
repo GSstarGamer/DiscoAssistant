@@ -1722,6 +1722,7 @@ class DiscoAssistant(discord.Client):
             openrouter_chat=self.openrouter_chat,
             http_session=self.http_session,
             config=cfg,
+            tavily_api_key=self.app_config.settings.tavily_api_key,
         )
 
     async def _tool_get_time(

@@ -10,7 +10,6 @@ from typing import Any
 
 import aiohttp
 from bs4 import BeautifulSoup
-from duckduckgo_search import DDGS
 
 from discoassistant.config import WebSearchConfig
 
@@ -21,6 +20,8 @@ OpenRouterChat = Callable[..., Awaitable[dict[str, Any]]]
 
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 
+_TAVILY_ENDPOINT = "https://api.tavily.com/search"
+
 
 async def run_web_search(
     *,
@@ -28,19 +29,22 @@ async def run_web_search(
     openrouter_chat: OpenRouterChat,
     http_session: aiohttp.ClientSession,
     config: WebSearchConfig,
+    tavily_api_key: str | None,
 ) -> dict[str, Any]:
     started = monotonic()
     LOGGER.info("Web search subagent start question=%r", question)
+    if not tavily_api_key:
+        return _error("no_api_key", "TAVILY_API_KEY not configured")
     try:
         queries = await _generate_queries(question, openrouter_chat, config)
         if not queries:
             return _error("no_queries", "subagent did not generate any queries")
         LOGGER.info("Web search queries generated count=%d queries=%s", len(queries), queries)
 
-        raw_results = await _ddg_search_all(queries, config)
+        raw_results = await _tavily_search_all(queries, http_session, tavily_api_key, config)
         if not raw_results:
-            return _error("no_results", "DuckDuckGo returned no results")
-        LOGGER.info("Web search DDG results count=%d", len(raw_results))
+            return _error("no_results", "Tavily returned no results")
+        LOGGER.info("Web search Tavily results count=%d", len(raw_results))
 
         picked = await _pick_urls(question, raw_results, openrouter_chat, config)
         if len(picked) < config.min_sites:
@@ -141,9 +145,14 @@ async def _generate_queries(
     return [q for q in queries[: config.max_queries] if isinstance(q, str) and q.strip()]
 
 
-async def _ddg_search_all(queries: list[str], config: WebSearchConfig) -> list[dict[str, str]]:
+async def _tavily_search_all(
+    queries: list[str],
+    http_session: aiohttp.ClientSession,
+    api_key: str,
+    config: WebSearchConfig,
+) -> list[dict[str, str]]:
     tasks = [
-        asyncio.to_thread(_ddg_search_sync, q, config.ddg_results_per_query)
+        _tavily_search_one(q, http_session, api_key, config.ddg_results_per_query)
         for q in queries
     ]
     nested = await asyncio.gather(*tasks, return_exceptions=True)
@@ -151,7 +160,7 @@ async def _ddg_search_all(queries: list[str], config: WebSearchConfig) -> list[d
     merged: list[dict[str, str]] = []
     for batch in nested:
         if isinstance(batch, BaseException):
-            LOGGER.warning("Web search DDG query failed error=%s", batch)
+            LOGGER.warning("Web search Tavily query failed error=%s", batch)
             continue
         for item in batch:
             url = item.get("url", "")
@@ -162,16 +171,29 @@ async def _ddg_search_all(queries: list[str], config: WebSearchConfig) -> list[d
     return merged
 
 
-def _ddg_search_sync(query: str, max_results: int) -> list[dict[str, str]]:
-    with DDGS() as ddgs:
-        hits = list(ddgs.text(query, max_results=max_results))
+async def _tavily_search_one(
+    query: str,
+    http_session: aiohttp.ClientSession,
+    api_key: str,
+    max_results: int,
+) -> list[dict[str, str]]:
+    payload = {
+        "api_key": api_key,
+        "query": query,
+        "max_results": max_results,
+        "search_depth": "basic",
+    }
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with http_session.post(_TAVILY_ENDPOINT, json=payload, timeout=timeout) as response:
+        response.raise_for_status()
+        data = await response.json()
     out: list[dict[str, str]] = []
-    for h in hits:
+    for h in data.get("results", []) or []:
         out.append(
             {
                 "title": h.get("title", "") or "",
-                "url": h.get("href", "") or h.get("url", "") or "",
-                "text": h.get("body", "") or h.get("snippet", "") or "",
+                "url": h.get("url", "") or "",
+                "text": h.get("content", "") or "",
             }
         )
     return out
