@@ -1675,7 +1675,19 @@ class DiscoAssistant(discord.Client):
 
         requested_target_user_id = arguments.get("target_user_id")
         if requested_target_user_id is None:
-            raise ValueError("send_dm.target_user_id is required. Do not guess recipient.")
+            bot_id = self.user.id if self.user is not None else None
+            mention_candidates = [
+                m.id for m in message.mentions
+                if m.id != author_id and (bot_id is None or m.id != bot_id)
+            ]
+            if len(mention_candidates) == 1:
+                requested_target_user_id = mention_candidates[0]
+            else:
+                raise ValueError(
+                    "send_dm.target_user_id is required. "
+                    f"Viable mentions in this message: {mention_candidates}. "
+                    "Either pick one of those ids, or call lookup_user first."
+                )
         target_user_id = self._resolve_target_user_id(message, requested_target_user_id)
 
         content = str(arguments.get("content", "")).strip()
