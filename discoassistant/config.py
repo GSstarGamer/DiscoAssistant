@@ -73,47 +73,19 @@ class OpenRouterConfig(BaseModel):
     site_url: str | None = None
 
 
-class WebSearchPrompts(BaseModel):
-    query_gen: str
-    url_pick: str
-    summarize: str
-    merge: str
-
-
-class WebSearchConfig(BaseModel):
+class WebToolsConfig(BaseModel):
     enabled: bool = False
-    model: str = "openai/gpt-5-nano"
+    fetch_model: str = "openai/gpt-5-nano"
     service_tier: str = "flex"
-    max_queries: int = 2
-    min_sites: int = 2
-    max_sites: int = 3
-    ddg_results_per_query: int = 10
+    temperature: float = 0.3
+    tavily_results_per_query: int = 10
     fetch_timeout_seconds: int = 12
     max_html_chars: int = 200_000
     summary_max_tokens: int = 600
-    merge_max_tokens: int = 900
-    temperature: float = 0.3
-    system_prompts: WebSearchPrompts = Field(
-        default_factory=lambda: WebSearchPrompts(
-            query_gen=(
-                "Generate {max_queries} concise DuckDuckGo search queries that would "
-                "surface authoritative info about the user's question. Return JSON: "
-                '{{"queries": ["q1", "q2"]}}.'
-            ),
-            url_pick=(
-                "From the search results, pick {min_sites} to {max_sites} URLs most "
-                "likely to contain a direct answer. Return JSON: "
-                '{{"urls": ["https://...", "https://..."]}}.'
-            ),
-            summarize=(
-                "Read the page content and write a focused summary that directly "
-                "addresses the user's question. Cite specific facts."
-            ),
-            merge=(
-                "Compare the per-site summaries below. Produce one solid final answer "
-                "for the original question. Note disagreements if any."
-            ),
-        )
+    fetch_system_prompt: str = (
+        "You read one web page and answer a specific question about it. "
+        "Be concise and factual. Quote sparingly (under 125 chars per quote). "
+        "If the page does not contain the answer, say so plainly."
     )
 
 
@@ -123,7 +95,7 @@ class RuntimeConfig(BaseModel):
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     openrouter: OpenRouterConfig = Field(default_factory=OpenRouterConfig)
-    web_search: WebSearchConfig = Field(default_factory=WebSearchConfig)
+    web_tools: WebToolsConfig = Field(default_factory=WebToolsConfig)
     tool_policy: ToolPolicy = Field(default_factory=ToolPolicy)
     prompts: dict[str, str] = Field(default_factory=dict)
     agents: dict[str, AgentDefinition] = Field(default_factory=dict)

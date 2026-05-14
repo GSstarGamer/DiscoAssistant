@@ -32,25 +32,16 @@
     "app_name": "DiscoAssistant",
     "site_url": null
   },
-  "web_search": {
+  "web_tools": {
     "enabled": true,
-    "model": "openai/gpt-5-nano",
+    "fetch_model": "openai/gpt-5-nano",
     "service_tier": "flex",
-    "max_queries": 2,
-    "min_sites": 2,
-    "max_sites": 3,
-    "ddg_results_per_query": 10,
+    "temperature": 0.3,
+    "tavily_results_per_query": 10,
     "fetch_timeout_seconds": 12,
     "max_html_chars": 200000,
     "summary_max_tokens": 600,
-    "merge_max_tokens": 900,
-    "temperature": 0.3,
-    "system_prompts": {
-      "query_gen": "Generate {max_queries} concise DuckDuckGo search queries that would surface authoritative info about the user's question. Return JSON: {{\"queries\": [\"q1\", \"q2\"]}}.",
-      "url_pick": "From the search results, pick {min_sites} to {max_sites} URLs most likely to contain a direct answer. Return JSON: {{\"urls\": [\"https://...\", \"https://...\"]}}.",
-      "summarize": "Read the page content and write a focused summary that directly addresses the user's question. Cite specific facts. Keep it tight.",
-      "merge": "Compare the per-site summaries below. Produce one solid final answer for the original question. Note disagreements if any."
-    }
+    "fetch_system_prompt": "You read one web page and answer a specific question about it. Be concise and factual. Quote sparingly (under 125 chars per quote). If the page does not contain the answer, say so plainly."
   },
   "tool_policy": {
     "allow_model_tool_calls": true,
@@ -89,7 +80,12 @@
       },
       {
         "name": "web_search",
-        "description": "Search the live web via a dedicated subagent. Use for current events, recent facts, or anything that needs up-to-date sources.",
+        "description": "Search the live web via Tavily. Returns a list of title+url results. Use for current events or anything needing fresh sources, then call web_fetch on the most promising URLs.",
+        "enabled": true
+      },
+      {
+        "name": "web_fetch",
+        "description": "Fetch one URL and answer a specific question about its content. Pass the URL plus a focused prompt. Returns a short grounded answer. Use after web_search to read selected pages.",
         "enabled": true
       },
       {
@@ -122,6 +118,7 @@
         "read_user_memory",
         "send_dm",
         "web_search",
+        "web_fetch",
         "get_time"
       ],
       "handoff_targets": []
@@ -137,6 +134,7 @@
         "read_channel",
         "lookup_user",
         "web_search",
+        "web_fetch",
         "get_time"
       ],
       "handoff_targets": []

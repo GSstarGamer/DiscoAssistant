@@ -15,14 +15,24 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiohttp
 import discord
+from bs4 import BeautifulSoup
 
 from discoassistant.config import BASE_DIR, AppConfig, load_app_config
 from discoassistant.dm_history import DmHistoryStore
 from discoassistant.memory import GuildMemoryStore, UserMemoryStore
-from discoassistant.web_search import run_web_search
 
 
 LOGGER = logging.getLogger("discoassistant")
+
+
+def _strip_html_text(raw: str, max_chars: int) -> str:
+    soup = BeautifulSoup(raw, "lxml")
+    for tag in soup(["script", "style", "nav", "footer", "header", "aside", "noscript", "form"]):
+        tag.decompose()
+    text = soup.get_text(separator="\n", strip=True)
+    if len(text) > max_chars:
+        text = text[:max_chars]
+    return text
 
 
 @dataclass(slots=True)
@@ -1328,6 +1338,8 @@ class DiscoAssistant(discord.Client):
             result = await self._tool_send_dm(arguments, tool_context)
         elif function_name == "web_search":
             result = await self._tool_web_search(arguments, tool_context)
+        elif function_name == "web_fetch":
+            result = await self._tool_web_fetch(arguments, tool_context)
         elif function_name == "get_time":
             result = await self._tool_get_time(arguments, tool_context)
         else:
@@ -1697,7 +1709,7 @@ class DiscoAssistant(discord.Client):
         arguments: dict[str, Any],
         tool_context: dict[str, Any],
     ) -> dict[str, Any]:
-        cfg = self.app_config.runtime.web_search
+        cfg = self.app_config.runtime.web_tools
         if not cfg.enabled:
             return {
                 "ok": False,
@@ -1710,20 +1722,152 @@ class DiscoAssistant(discord.Client):
                 "error_type": "no_http_session",
                 "error_message": "HTTP session not ready",
             }
-        question = str(arguments.get("question", "")).strip()
-        if not question:
+        api_key = self.app_config.settings.tavily_api_key
+        if not api_key:
+            return {
+                "ok": False,
+                "error_type": "no_api_key",
+                "error_message": "TAVILY_API_KEY not configured",
+            }
+        query = str(arguments.get("query", "")).strip()
+        if not query:
             return {
                 "ok": False,
                 "error_type": "bad_args",
-                "error_message": "web_search.question is required",
+                "error_message": "web_search.query is required",
             }
-        return await run_web_search(
-            question=question,
-            openrouter_chat=self.openrouter_chat,
-            http_session=self.http_session,
-            config=cfg,
-            tavily_api_key=self.app_config.settings.tavily_api_key,
+        payload = {
+            "api_key": api_key,
+            "query": query,
+            "max_results": cfg.tavily_results_per_query,
+            "search_depth": "basic",
+        }
+        timeout = aiohttp.ClientTimeout(total=15)
+        try:
+            async with self.http_session.post(
+                "https://api.tavily.com/search",
+                json=payload,
+                timeout=timeout,
+            ) as response:
+                response.raise_for_status()
+                data = await response.json()
+        except Exception as exc:
+            LOGGER.warning("web_search Tavily error query=%r error=%s", query, exc)
+            return {
+                "ok": False,
+                "error_type": "tavily_error",
+                "error_message": f"{type(exc).__name__}: {exc}",
+            }
+        results: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for hit in data.get("results") or []:
+            url = (hit.get("url") or "").strip()
+            title = (hit.get("title") or "").strip()
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            results.append({"title": title, "url": url})
+        return {"ok": True, "query": query, "results": results}
+
+    async def _tool_web_fetch(
+        self,
+        arguments: dict[str, Any],
+        tool_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        cfg = self.app_config.runtime.web_tools
+        if not cfg.enabled:
+            return {
+                "ok": False,
+                "error_type": "disabled",
+                "error_message": "web_fetch is disabled in config",
+            }
+        if self.http_session is None:
+            return {
+                "ok": False,
+                "error_type": "no_http_session",
+                "error_message": "HTTP session not ready",
+            }
+        url = str(arguments.get("url", "")).strip()
+        prompt = str(arguments.get("prompt", "")).strip()
+        if not url:
+            return {
+                "ok": False,
+                "error_type": "bad_args",
+                "error_message": "web_fetch.url is required",
+            }
+        if not prompt:
+            return {
+                "ok": False,
+                "error_type": "bad_args",
+                "error_message": "web_fetch.prompt is required",
+            }
+        if not url.lower().startswith(("http://", "https://")):
+            return {
+                "ok": False,
+                "error_type": "bad_args",
+                "error_message": "web_fetch.url must start with http:// or https://",
+            }
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml",
+        }
+        timeout = aiohttp.ClientTimeout(total=cfg.fetch_timeout_seconds)
+        try:
+            async with self.http_session.get(url, timeout=timeout, headers=headers) as response:
+                response.raise_for_status()
+                html = await response.text(errors="ignore")
+        except Exception as exc:
+            LOGGER.warning("web_fetch fetch error url=%s error=%s", url, exc)
+            return {
+                "ok": False,
+                "error_type": "fetch",
+                "error_message": f"{type(exc).__name__}: {exc}",
+            }
+        text = await asyncio.to_thread(_strip_html_text, html, cfg.max_html_chars)
+        if not text:
+            return {
+                "ok": False,
+                "error_type": "empty_page",
+                "error_message": "no extractable text on page",
+            }
+        user_prompt = (
+            f"URL: {url}\n\nQuestion: {prompt}\n\nPage content:\n{text}"
         )
+        try:
+            response = await self.openrouter_chat(
+                model=cfg.fetch_model,
+                messages=[
+                    {"role": "system", "content": cfg.fetch_system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                extra_payload={
+                    "temperature": cfg.temperature,
+                    "max_tokens": cfg.summary_max_tokens,
+                    "service_tier": cfg.service_tier,
+                },
+            )
+        except Exception as exc:
+            LOGGER.warning("web_fetch summarize error url=%s error=%s", url, exc)
+            return {
+                "ok": False,
+                "error_type": "summarize",
+                "error_message": f"{type(exc).__name__}: {exc}",
+            }
+        choices = response.get("choices") or []
+        answer = ""
+        if choices:
+            message = choices[0].get("message") or {}
+            answer = (message.get("content") or "").strip()
+        if not answer:
+            return {
+                "ok": False,
+                "error_type": "empty_answer",
+                "error_message": "model returned no content",
+            }
+        return {"ok": True, "url": url, "answer": answer}
 
     async def _tool_get_time(
         self,
@@ -2116,21 +2260,49 @@ class DiscoAssistant(discord.Client):
                     "function": {
                         "name": "web_search",
                         "description": (
-                            "Research a question using the live web via a dedicated subagent. "
-                            "The subagent issues DuckDuckGo queries, fetches 2-3 source pages in parallel, "
-                            "summarizes each, then merges them into one grounded answer. "
+                            "Search the live web via Tavily. Returns a list of {title, url} results — no snippets, no page content. "
                             "Use for current events, recent facts, or anything that needs up-to-date sources. "
-                            "Pass the user's question verbatim or a tight reformulation."
+                            "After searching, pick the most promising URL(s) and call web_fetch on them to actually read the content."
                         ),
                         "parameters": {
                             "type": "object",
                             "properties": {
-                                "question": {
+                                "query": {
                                     "type": "string",
-                                    "description": "The question or topic to research on the live web.",
+                                    "description": "The search query to send to Tavily.",
                                 },
                             },
-                            "required": ["question"],
+                            "required": ["query"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            )
+
+        if "web_fetch" in allowed:
+            schemas.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "web_fetch",
+                        "description": (
+                            "Fetch one URL and answer a focused question about its content. "
+                            "Only pass URLs that came from a prior web_search result or from the user's own message — do not invent URLs. "
+                            "Returns a short grounded answer string. Typically used after web_search to actually read a page."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "url": {
+                                    "type": "string",
+                                    "description": "The http(s) URL to fetch.",
+                                },
+                                "prompt": {
+                                    "type": "string",
+                                    "description": "The specific question to answer using the page's content.",
+                                },
+                            },
+                            "required": ["url", "prompt"],
                             "additionalProperties": False,
                         },
                     },
