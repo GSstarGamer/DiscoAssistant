@@ -572,6 +572,9 @@ class DiscoAssistant(discord.Client):
         if tools:
             extra_payload["tools"] = tools
             extra_payload["tool_choice"] = self._tool_choice_for_message(message)
+            forced_dm = self._force_dm_tool_if_intended(message, selected_agent.tools)
+            if forced_dm is not None:
+                extra_payload["tool_choice"] = forced_dm
 
         tool_context: dict[str, Any] = {"message": message}
         response = await self._run_chat_with_tools_if_needed(
@@ -2475,6 +2478,29 @@ class DiscoAssistant(discord.Client):
                 },
             }
         return "auto"
+
+    _DM_INTENT_PATTERN = re.compile(
+        r"\b(tell|message|msg|dm|text|let|ping|forward|relay|pass(?:\s+(?:it|that))?(?:\s+(?:on|along))?)\b"
+        r"\s+(?:to\s+)?(?:<@!?\d+>|@\w+|gs\b|owner\b|him\b|her\b|them\b|"
+        r"(?!me\b|us\b|myself\b|everyone\b|anyone\b|you\b|yourself\b|yall\b|y'all\b)"
+        r"[A-Za-z][\w._]{1,30})",
+        re.IGNORECASE,
+    )
+
+    def _force_dm_tool_if_intended(
+        self,
+        message: discord.Message,
+        agent_tool_names: list[str],
+    ) -> dict[str, Any] | None:
+        text = self._message_text_for_context(message) or ""
+        if not self._DM_INTENT_PATTERN.search(text):
+            return None
+        is_owner = message.author.id == self.app_config.settings.owner_user_id
+        if is_owner and "send_dm" in agent_tool_names:
+            return {"type": "function", "function": {"name": "send_dm"}}
+        if not is_owner and "message_owner" in agent_tool_names:
+            return {"type": "function", "function": {"name": "message_owner"}}
+        return None
 
     def _has_active_conversation(self, message: discord.Message) -> bool:
         if self._is_direct_message(message):
