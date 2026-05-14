@@ -1336,6 +1336,8 @@ class DiscoAssistant(discord.Client):
             result = await self._tool_read_user_memory(arguments, tool_context)
         elif function_name == "send_dm":
             result = await self._tool_send_dm(arguments, tool_context)
+        elif function_name == "message_owner":
+            result = await self._tool_message_owner(arguments, tool_context)
         elif function_name == "web_search":
             result = await self._tool_web_search(arguments, tool_context)
         elif function_name == "web_fetch":
@@ -1702,6 +1704,54 @@ class DiscoAssistant(discord.Client):
             "dm_channel_id": dm_channel.id,
             "message_id": sent_message.id,
             "sent_content": content,
+        }
+
+    async def _tool_message_owner(
+        self,
+        arguments: dict[str, Any],
+        tool_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        message: discord.Message = tool_context["message"]
+        author_id = message.author.id
+        owner_user_id = self.app_config.settings.owner_user_id
+
+        if author_id == owner_user_id:
+            raise ValueError("message_owner is for non-owners only.")
+
+        content = str(arguments.get("content", "")).strip()
+        if not content:
+            raise ValueError("message_owner.content is required.")
+
+        author_display = self._display_name_for_message_author(message)
+        guild = getattr(message, "guild", None)
+        if guild is not None:
+            channel_name = getattr(message.channel, "name", None) or str(message.channel.id)
+            location = f"#{channel_name} in {guild.name}"
+        else:
+            location = "DM"
+
+        attributed = (
+            f"📨 Relay from **{author_display}** (`{author_id}`) — {location}:\n"
+            f"{content}"
+        )
+
+        owner_user = self.get_user(owner_user_id)
+        if owner_user is None:
+            owner_user = await self.fetch_user(owner_user_id)
+
+        dm_channel = owner_user.dm_channel
+        if dm_channel is None:
+            dm_channel = await owner_user.create_dm()
+
+        sent_message = await dm_channel.send(attributed)
+        self._store_outgoing_dm_message(sent_message)
+        return {
+            "ok": True,
+            "from_user_id": author_id,
+            "target_user_id": owner_user_id,
+            "dm_channel_id": dm_channel.id,
+            "message_id": sent_message.id,
+            "sent_content": attributed,
         }
 
     async def _tool_web_search(
@@ -2233,9 +2283,8 @@ class DiscoAssistant(discord.Client):
                     "function": {
                         "name": "send_dm",
                         "description": (
-                            "Send a direct message to a specific Discord user. "
+                            "Owner-only. Send a direct message to a specific Discord user. "
                             "target_user_id MUST come from a mention, lookup_user, or prior context — never guess. "
-                            "Non-owner can only target the owner; owner can target anyone. "
                             "Never claim the message was sent unless this tool returned ok=true."
                         ),
                         "parameters": {
@@ -2251,6 +2300,34 @@ class DiscoAssistant(discord.Client):
                                 },
                             },
                             "required": ["target_user_id", "content"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            )
+
+        if "message_owner" in allowed:
+            schemas.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "message_owner",
+                        "description": (
+                            "Public-only. Relay a short message from this chatter to the owner via DM. "
+                            "Use when someone says things like 'tell gs to text me', 'message gs', 'let gs know X'. "
+                            "Author identity, user id, and channel are auto-attached — you do not include them. "
+                            "Just pass the content the chatter wants the owner to see. "
+                            "Never claim the message was sent unless this tool returned ok=true."
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "content": {
+                                    "type": "string",
+                                    "description": "The message to relay to the owner.",
+                                },
+                            },
+                            "required": ["content"],
                             "additionalProperties": False,
                         },
                     },
@@ -2724,6 +2801,9 @@ class DiscoAssistant(discord.Client):
                 if item.get("name") == "send_dm" and payload.get("ok") is True:
                     target_user_id = payload.get("target_user_id")
                     return f"Message sent to user `{target_user_id}`."
+
+                if item.get("name") == "message_owner" and payload.get("ok") is True:
+                    return "passed it along to gs"
 
         return default
 
