@@ -573,15 +573,15 @@ class DiscoAssistant(discord.Client):
             extra_payload["tools"] = tools
             extra_payload["tool_choice"] = self._tool_choice_for_message(message)
 
+        tool_context: dict[str, Any] = {"message": message}
         response = await self._run_chat_with_tools_if_needed(
             model=selected_agent.model,
             messages=messages,
             extra_payload=extra_payload,
-            tool_context={
-                "message": message,
-            },
+            tool_context=tool_context,
         )
         reply_text = self.extract_response_text(response, messages=messages)
+        reply_text = self._sanitize_false_delivery_claim(reply_text, tool_context)
         if reply_text == "I couldn't produce a normal reply, but I can try again.":
             recovery_messages = [
                 *messages,
@@ -816,6 +816,7 @@ class DiscoAssistant(discord.Client):
         tool_context: dict[str, Any],
     ) -> dict[str, Any]:
         current_payload = dict(extra_payload)
+        tool_calls_log: list[dict[str, Any]] = tool_context.setdefault("tool_calls_log", [])
         response = await self.openrouter_chat(
             model=model,
             messages=messages,
@@ -875,6 +876,12 @@ class DiscoAssistant(discord.Client):
                         "error_type": type(exc).__name__,
                         "error_message": str(exc),
                     }
+                tool_calls_log.append(
+                    {
+                        "name": tool_call["function"]["name"],
+                        "ok": tool_result.get("ok") is True,
+                    }
+                )
                 if tool_result.get("ok") is False:
                     unresolved_tool_failure = {
                         "name": tool_call["function"]["name"],
@@ -2818,6 +2825,38 @@ class DiscoAssistant(discord.Client):
                     return "passed it along to gs"
 
         return default
+
+    _FALSE_DELIVERY_PATTERN = re.compile(
+        r"^\s*(sent\.?|sent it\.?|done\.?|done,?\s*sent\.?|"
+        r"dm['’]?d (them|him|her|gs|him\.?|her\.?)?\.?|"
+        r"messaged (them|him|her|gs)\.?|"
+        r"passed (it|that) (on|along)( to .+)?\.?|"
+        r"relayed( it| that)?( to .+)?\.?|"
+        r"let (them|him|her|gs) know\.?|"
+        r"told (them|him|her|gs)\.?)\s*$",
+        re.IGNORECASE,
+    )
+
+    @staticmethod
+    def _sanitize_false_delivery_claim(
+        reply_text: str,
+        tool_context: dict[str, Any],
+    ) -> str:
+        log = tool_context.get("tool_calls_log") or []
+        delivered = any(
+            entry.get("name") in {"send_dm", "message_owner"} and entry.get("ok") is True
+            for entry in log
+        )
+        if delivered:
+            return reply_text
+        if DiscoAssistant._FALSE_DELIVERY_PATTERN.match(reply_text or ""):
+            LOGGER.warning(
+                "Blocked false-delivery claim reply=%r tool_calls=%s",
+                reply_text,
+                log,
+            )
+            return "couldn't actually send that — no recipient resolved"
+        return reply_text
 
     @staticmethod
     def _safe_runtime_error_reply(exc: Exception) -> str:
