@@ -25,6 +25,18 @@ from discoassistant.memory import GuildMemoryStore, UserMemoryStore
 LOGGER = logging.getLogger("discoassistant")
 
 
+_RELAY_HEADER_RE = re.compile(
+    r"^\s*[\U0001F300-\U0001FAFF☀-➿]?\s*"
+    r"(?:relay|message|note|forward|fwd)[^\n:]{0,80}?:\s*",
+    re.IGNORECASE,
+)
+
+
+def _strip_relay_header(content: str) -> str:
+    stripped = _RELAY_HEADER_RE.sub("", content, count=1).strip()
+    return stripped or content.strip()
+
+
 def _strip_html_text(raw: str, max_chars: int) -> str:
     soup = BeautifulSoup(raw, "lxml")
     for tag in soup(["script", "style", "nav", "footer", "header", "aside", "noscript", "form"]):
@@ -1778,15 +1790,18 @@ class DiscoAssistant(discord.Client):
         if not content:
             raise ValueError("message_owner.content is required.")
 
+        content = _strip_relay_header(content)
+        if not content:
+            raise ValueError("message_owner.content is required.")
+
         author_display = self._display_name_for_message_author(message)
         guild = getattr(message, "guild", None)
         if guild is not None:
             channel_name = getattr(message.channel, "name", None) or str(message.channel.id)
             location = f"#{channel_name} in {guild.name}"
+            attributed = f"{author_display} from {location} says: {content}"
         else:
-            location = "DM"
-
-        attributed = f"{author_display} ({location}): {content}"
+            attributed = f"{author_display} says: {content}"
 
         owner_user = self.get_user(owner_user_id)
         if owner_user is None:
@@ -2375,7 +2390,8 @@ class DiscoAssistant(discord.Client):
                             "Public-only. Relay a short message from this chatter to the owner via DM. "
                             "Use when someone says things like 'tell gs to text me', 'message gs', 'let gs know X'. "
                             "Author identity, user id, and channel are auto-attached — you do not include them. "
-                            "Just pass the content the chatter wants the owner to see. "
+                            "Just pass the natural content the chatter wants the owner to see. "
+                            "Do NOT add prefixes like 'Relay from <name>:', '📨', '<id>:', or any header — the wrapper handles that. "
                             "Never claim the message was sent unless this tool returned ok=true."
                         ),
                         "parameters": {
@@ -2383,7 +2399,7 @@ class DiscoAssistant(discord.Client):
                             "properties": {
                                 "content": {
                                     "type": "string",
-                                    "description": "The message to relay to the owner.",
+                                    "description": "Just the message text the chatter wants the owner to see. No emoji prefix, no 'Relay from X', no user id, no headers.",
                                 },
                             },
                             "required": ["content"],
