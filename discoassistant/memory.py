@@ -5,7 +5,13 @@ from pathlib import Path
 
 
 NOTES_HEADER = "## Notes"
+STYLE_HEADER = "## Style"
 OWNER_RULES_HEADER = "## Owner Rules"
+
+USER_CATEGORY_HEADERS = {
+    "notes": NOTES_HEADER,
+    "style": STYLE_HEADER,
+}
 
 
 def _append_to_section(content: str, header: str, line: str, default_after_header_blank: bool = True) -> str:
@@ -127,8 +133,15 @@ class UserMemoryStore:
         note: str,
         author_display_name: str | None = None,
         source_channel_id: int | None = None,  # kept for back-compat; not used in line
+        category: str = "notes",
     ) -> Path:
         del source_channel_id
+        header = USER_CATEGORY_HEADERS.get(category)
+        if header is None:
+            raise ValueError(
+                f"Unknown user memory category {category!r}; allowed: "
+                f"{sorted(USER_CATEGORY_HEADERS)}"
+            )
         path = self.path_for_user(user_id)
         safe_note = note.strip()
         if not safe_note:
@@ -142,7 +155,7 @@ class UserMemoryStore:
                 author_display_name=author_display_name,
             )
 
-        new_content = _append_to_section(existing, NOTES_HEADER, f"- {safe_note}")
+        new_content = _append_to_section(existing, header, f"- {safe_note}")
         path.write_text(new_content, encoding="utf-8")
         return path
 
@@ -178,6 +191,7 @@ class UserMemoryStore:
             f"## Identity\n"
             f"- user_id: {user_id}\n"
             f"- display_name: {display_name}\n\n"
+            f"## Style\n\n"
             f"## Notes\n"
         )
 

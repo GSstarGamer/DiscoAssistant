@@ -1464,23 +1464,29 @@ class DiscoAssistant(discord.Client):
         tool_context: dict[str, Any],
     ) -> dict[str, Any]:
         message: discord.Message = tool_context["message"]
-        self._require_owner(message, "remember")
         scope = str(arguments.get("scope", "")).strip().lower()
         if scope not in {"user", "server"}:
             raise ValueError("remember.scope must be 'user' or 'server'.")
+        if scope == "server":
+            self._require_owner(message, "remember(scope='server')")
         note = str(arguments.get("note", "")).strip()
         if not note:
             raise ValueError("remember.note is required.")
 
         if scope == "user":
+            category = str(arguments.get("category", "notes")).strip().lower() or "notes"
+            if category not in {"notes", "style"}:
+                raise ValueError("remember.category must be 'notes' or 'style' when scope='user'.")
             path = self.user_memory_store.append_for_user(
                 user_id=message.author.id,
                 note=note,
                 author_display_name=self._display_name_for_message_author(message),
+                category=category,
             )
             return {
                 "ok": True,
                 "scope": "user",
+                "category": category,
                 "user_id": message.author.id,
                 "path": str(path),
                 "appended_note": note,
@@ -1780,10 +1786,7 @@ class DiscoAssistant(discord.Client):
         else:
             location = "DM"
 
-        attributed = (
-            f"📨 Relay from **{author_display}** (`{author_id}`) — {location}:\n"
-            f"{content}"
-        )
+        attributed = f"{author_display} ({location}): {content}"
 
         owner_user = self.get_user(owner_user_id)
         if owner_user is None:
@@ -2243,10 +2246,11 @@ class DiscoAssistant(discord.Client):
                     "function": {
                         "name": "remember",
                         "description": (
-                            "Owner-only. Save a durable note to memory. "
-                            "scope='user' appends to the current user's memory file (identity, projects, long-term preferences, biographical facts). "
-                            "scope='server' appends to the current guild's shared memory (server-wide rules, channel norms, cues that should affect replies for everyone in this guild). "
-                            "Notes are written under the file's '## Notes' section. Save only things that should still matter next week."
+                            "Save a durable note to memory. "
+                            "scope='user' (open to anyone) appends to the calling user's own memory file. Each caller can only write to their own slot. "
+                            "scope='server' (owner-only) appends to the current guild's shared memory — server-wide rules, channel norms, cues that should affect replies for everyone in this guild. "
+                            "For scope='user', pick category: 'notes' (default — durable biographical facts, projects, plans, preferences) or 'style' (how this person talks: casing, slang, length, emoji habits, punctuation quirks, mirroring cues). "
+                            "Style entries are read every reply so the bot can mirror them. Save only things that should still matter next week."
                         ),
                         "parameters": {
                             "type": "object",
@@ -2255,6 +2259,11 @@ class DiscoAssistant(discord.Client):
                                     "type": "string",
                                     "enum": ["user", "server"],
                                     "description": "Which memory file to write to.",
+                                },
+                                "category": {
+                                    "type": "string",
+                                    "enum": ["notes", "style"],
+                                    "description": "Only used when scope='user'. 'notes' for facts, 'style' for talking-style cues. Defaults to 'notes'.",
                                 },
                                 "note": {
                                     "type": "string",
