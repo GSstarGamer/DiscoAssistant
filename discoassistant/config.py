@@ -81,7 +81,7 @@ class WebToolsConfig(BaseModel):
     tavily_results_per_query: int = 10
     fetch_timeout_seconds: int = 12
     max_html_chars: int = 200_000
-    summary_max_tokens: int = 600
+    summary_max_tokens: int = 2000
     fetch_system_prompt: str = (
         "You read one web page and answer a specific question about it. "
         "Be concise and factual. Quote sparingly (under 125 chars per quote). "

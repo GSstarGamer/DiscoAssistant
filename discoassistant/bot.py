@@ -1847,6 +1847,7 @@ class DiscoAssistant(discord.Client):
                     "temperature": cfg.temperature,
                     "max_tokens": cfg.summary_max_tokens,
                     "service_tier": cfg.service_tier,
+                    "reasoning": {"effort": "minimal", "exclude": True},
                 },
             )
         except Exception as exc:
@@ -1861,11 +1862,14 @@ class DiscoAssistant(discord.Client):
         if choices:
             message = choices[0].get("message") or {}
             answer = (message.get("content") or "").strip()
+            if not answer:
+                answer = (message.get("reasoning") or "").strip()
         if not answer:
+            finish_reason = choices[0].get("finish_reason") if choices else None
             return {
                 "ok": False,
                 "error_type": "empty_answer",
-                "error_message": "model returned no content",
+                "error_message": f"model returned no content (finish_reason={finish_reason})",
             }
         return {"ok": True, "url": url, "answer": answer}
 

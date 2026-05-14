@@ -40,7 +40,7 @@
     "tavily_results_per_query": 10,
     "fetch_timeout_seconds": 12,
     "max_html_chars": 200000,
-    "summary_max_tokens": 600,
+    "summary_max_tokens": 2000,
     "fetch_system_prompt": "You read one web page and answer a specific question about it. Be concise and factual. Quote sparingly (under 125 chars per quote). If the page does not contain the answer, say so plainly."
   },
   "tool_policy": {
