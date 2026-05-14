@@ -581,6 +581,34 @@ class DiscoAssistant(discord.Client):
             tool_context=tool_context,
         )
         reply_text = self.extract_response_text(response, messages=messages)
+
+        if self._is_false_delivery_claim(reply_text, tool_context):
+            LOGGER.warning(
+                "False-delivery claim detected reply=%r; forcing tool retry",
+                reply_text,
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "You replied as if a message was delivered, but no send_dm or "
+                        "message_owner tool call succeeded this turn. Either call the "
+                        "correct tool now with concrete arguments (mention id, content), "
+                        "or admit honestly that you cannot send. Do not claim delivery again."
+                    ),
+                }
+            )
+            forced_payload = dict(extra_payload)
+            if "tools" in forced_payload:
+                forced_payload["tool_choice"] = "required"
+            response = await self._run_chat_with_tools_if_needed(
+                model=selected_agent.model,
+                messages=messages,
+                extra_payload=forced_payload,
+                tool_context=tool_context,
+            )
+            reply_text = self.extract_response_text(response, messages=messages)
+
         reply_text = self._sanitize_false_delivery_claim(reply_text, tool_context)
         if reply_text == "I couldn't produce a normal reply, but I can try again.":
             recovery_messages = [
@@ -2838,22 +2866,29 @@ class DiscoAssistant(discord.Client):
     )
 
     @staticmethod
-    def _sanitize_false_delivery_claim(
+    def _is_false_delivery_claim(
         reply_text: str,
         tool_context: dict[str, Any],
-    ) -> str:
+    ) -> bool:
         log = tool_context.get("tool_calls_log") or []
         delivered = any(
             entry.get("name") in {"send_dm", "message_owner"} and entry.get("ok") is True
             for entry in log
         )
         if delivered:
-            return reply_text
-        if DiscoAssistant._FALSE_DELIVERY_PATTERN.match(reply_text or ""):
+            return False
+        return bool(DiscoAssistant._FALSE_DELIVERY_PATTERN.match(reply_text or ""))
+
+    @staticmethod
+    def _sanitize_false_delivery_claim(
+        reply_text: str,
+        tool_context: dict[str, Any],
+    ) -> str:
+        if DiscoAssistant._is_false_delivery_claim(reply_text, tool_context):
             LOGGER.warning(
                 "Blocked false-delivery claim reply=%r tool_calls=%s",
                 reply_text,
-                log,
+                tool_context.get("tool_calls_log"),
             )
             return "couldn't actually send that — no recipient resolved"
         return reply_text
